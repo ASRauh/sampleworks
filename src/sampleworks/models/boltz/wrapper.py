@@ -789,23 +789,12 @@ class Boltz2Wrapper:
 
             s, z = pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
 
-        q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
-            self.model.diffusion_conditioning(
-                s_trunk=s,
-                z_trunk=z,
-                relative_position_encoding=relative_position_encoding,
-                feats=features,
-            )
+        diffusion_conditioning = self._build_diffusion_conditioning(
+            s_trunk=s,
+            z_trunk=z,
+            relative_position_encoding=relative_position_encoding,
+            feats=features,
         )
-
-        diffusion_conditioning = {
-            "q": q,
-            "c": c,
-            "to_keys": to_keys,
-            "atom_enc_bias": atom_enc_bias,
-            "atom_dec_bias": atom_dec_bias,
-            "token_trans_bias": token_trans_bias,
-        }
 
         return {
             "s": s,
@@ -814,6 +803,54 @@ class Boltz2Wrapper:
             "relative_position_encoding": relative_position_encoding,
             "feats": features,
             "diffusion_conditioning": diffusion_conditioning,
+        }
+
+    def _build_diffusion_conditioning(
+        self,
+        s_trunk: Tensor,
+        z_trunk: Tensor,
+        relative_position_encoding: Tensor,
+        feats: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Derive the diffusion module's conditioning bundle from the trunk latents.
+
+        Boltz2 collapses ``s`` and ``z`` into six coordinate-independent tensors that the
+        diffusion module reuses at every denoising step. ``featurize`` computes them once;
+        ``step`` recomputes them when a latent has to stay on the autograd path.
+
+        Parameters
+        ----------
+        s_trunk : Tensor
+            Single representation, shape [batch, tokens, dim].
+        z_trunk : Tensor
+            Pair representation, shape [batch, tokens, tokens, dim].
+        relative_position_encoding : Tensor
+            Relative position encoding, as produced by the trunk pass.
+        feats : dict[str, Any]
+            Raw batch dict from the dataloader.
+
+        Returns
+        -------
+        dict[str, Any]
+            The six entries ``DiffusionModule.forward`` indexes. ``to_keys`` is a closure,
+            not a tensor.
+        """
+        q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
+            self.model.diffusion_conditioning(
+                s_trunk=s_trunk,
+                z_trunk=z_trunk,
+                relative_position_encoding=relative_position_encoding,
+                feats=feats,
+            )
+        )
+
+        return {
+            "q": q,
+            "c": c,
+            "to_keys": to_keys,
+            "atom_enc_bias": atom_enc_bias,
+            "atom_dec_bias": atom_dec_bias,
+            "token_trans_bias": token_trans_bias,
         }
 
     def step(
