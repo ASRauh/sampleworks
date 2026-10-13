@@ -283,8 +283,11 @@ class BoltzConditioning:
         Relative position encoding tensor.
     feats : dict[str, Any]
         Raw batch dict from dataloader.
-    diffusion_conditioning : dict[str, Tensor] | None
-        Additional diffusion conditioning (Boltz2 only).
+    diffusion_conditioning : dict[str, Any] | None
+        Boltz2 only. The bundle ``DiffusionModule.forward`` indexes: ``q``, ``c``,
+        ``to_keys``, ``atom_enc_bias``, ``atom_dec_bias``, ``token_trans_bias``. The values
+        are not all tensors -- ``to_keys`` is a windowing closure over the atom-attention
+        index matrix -- so the value type is ``Any``.
     true_atom_array : AtomArray | None
         Original structure's atom array (occupancy-filtered) for reward computation.
         Boltz's internal atom representation may differ from this due to padding, etc.
@@ -299,7 +302,7 @@ class BoltzConditioning:
     s_inputs: Tensor
     relative_position_encoding: Tensor
     feats: dict[str, Any]
-    diffusion_conditioning: dict[str, Tensor] | None = None
+    diffusion_conditioning: dict[str, Any] | None = None
     true_atom_array: AtomArray | None = None
     model_atom_array: AtomArray | None = None
 
