@@ -906,6 +906,17 @@ class Boltz2Wrapper:
         else:
             raise ValueError("pad_len is negative, cannot pad x_t")
 
+        # The cached bundle freezes s and z, and the diffusion module reads z only through it.
+        # Rebuild from live latents when one is optimizable, or IT-opt's gradient goes nowhere.
+        diffusion_conditioning = cond.diffusion_conditioning
+        if torch.is_grad_enabled() and (cond.s.requires_grad or cond.z.requires_grad):
+            diffusion_conditioning = self._build_diffusion_conditioning(
+                s_trunk=cond.s,
+                z_trunk=cond.z,
+                relative_position_encoding=cond.relative_position_encoding,
+                feats=feats,
+            )
+
         padded_atom_coords_denoised = self.model.structure_module.preconditioned_network_forward(
             padded_x_t,
             t_tensor,
@@ -914,7 +925,7 @@ class Boltz2Wrapper:
                 s_inputs=cond.s_inputs,
                 s_trunk=cond.s,
                 feats=feats,
-                diffusion_conditioning=cond.diffusion_conditioning,
+                diffusion_conditioning=diffusion_conditioning,
             ),
         )
 
