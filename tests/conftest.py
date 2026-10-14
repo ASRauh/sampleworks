@@ -45,6 +45,28 @@ from tests.mocks import MockFlowModelWrapper, MockStepScaler
 from tests.mocks.rewards import MockGradientRewardFunction
 
 
+@pytest.fixture
+def seq_5i09_deposited() -> str:
+    """Return the deposited 386-residue sequence for PDB 5I09 chain A.
+
+    Returns
+    -------
+    str
+        The deposited sequence, including the residues absent from the density
+        input structure.
+    """
+    return (
+        "MVEATAQETDRPRFSFSIAAREGKARTGTIEMKRGVIRTPAFMPVGTAAT"
+        "VKALKPETVRATGADIILGNTYHLMLRPGAERIAKLGGLHSFMGWDRPI"
+        "LTDSGGYQVMSLSSLTKQSEEGVTFKSHLDGSRHMLSPERSIEIQHLLG"
+        "SDIVMAFDECTPYPATPSRAASSMERSMRWAKRSRDAFDSRKEQAENAAL"
+        "FGIQQGSVFENLRQQSADALAEIGFDGYAVGGLAVGEGQDEMFRVLDFSVP"
+        "MLPDDKPHYLMGVGKPDDIVGAVERGIDMFDCVLPTRSGRNGQAFTWDG"
+        "PINIRNARFSEDLKPLDSECHCAVCQKWSRAYIHHLIRAGEILGAMLMTE"
+        "HNIAFYQQLMQKIRDSISEGRFSQFAQDFRARYFARNS"
+    )
+
+
 if TYPE_CHECKING:
     from sampleworks.models.boltz.wrapper import (
         Boltz1Wrapper,
@@ -450,6 +472,12 @@ def structure_1vme(resources_dir: Path) -> dict:
 
 
 @pytest.fixture(scope="session")
+def structure_1vme_density(resources_dir: Path) -> dict:
+    """1VME density input. Its chain A also carries CL/FEO ligand residues (malformed)."""
+    return parse_and_remove_hydrogens(resources_dir / "1vme" / "1VME_single_001_density_input.cif")
+
+
+@pytest.fixture(scope="session")
 def atom_array_1vme_with_missing_atoms(structure_1vme) -> AtomArray:
     """1VME atom array after parse_atom_array with add_missing_atoms=True.
 
@@ -514,6 +542,58 @@ def structure_9bn8_density(resources_dir: Path) -> dict:
 @pytest.fixture(scope="session")
 def structure_5i09_density(resources_dir: Path) -> dict:
     return parse_and_remove_hydrogens(resources_dir / "5I09" / "5I09_single_001_density_input.cif")
+
+
+@pytest.fixture(scope="session")
+def structure_5i09_prediction(resources_dir: Path) -> dict:
+    return parse_and_remove_hydrogens(resources_dir / "5I09" / "5I09_prediction.cif")
+
+
+@pytest.fixture(scope="session")
+def structure_5i09_prediction_deleted_atoms(resources_dir: Path) -> dict:
+    return parse_and_remove_hydrogens(resources_dir / "5I09" / "5I09_prediction_deleted_atoms.cif")
+
+
+@pytest.fixture(scope="session")
+def structure_5i09_prediction_deleted_atoms_idxs() -> list[dict]:
+    return [
+        {
+            "chain_id": "A",
+            "res_id": 32,
+            "res_name": "MET",
+            "atom_name": "CE",
+        },
+        {
+            "chain_id": "A",
+            "res_id": 223,
+            "res_name": "PHE",
+            "atom_name": "CG",
+        },
+        {
+            "chain_id": "A",
+            "res_id": 368,
+            "res_name": "GLY",
+            "atom_name": "N",
+        },
+        {
+            "chain_id": "A",
+            "res_id": 368,
+            "res_name": "GLY",
+            "atom_name": "CA",
+        },
+        {
+            "chain_id": "A",
+            "res_id": 368,
+            "res_name": "GLY",
+            "atom_name": "C",
+        },
+        {
+            "chain_id": "A",
+            "res_id": 368,
+            "res_name": "GLY",
+            "atom_name": "O",
+        },
+    ]
 
 
 @pytest.fixture(scope="session")
@@ -699,6 +779,8 @@ def protpardelle_checkpoint_path() -> Path:
     # if the user specifies a path to the model_params directory, use that instead.
     path = Path(os.environ.get("PROTPARDELLE_MODEL_PARAMS", builtin_path))
     path = path / "weights/cc89_epoch415.pth"
+    if not path.exists():
+        pytest.skip(f"Protpardelle checkpoint not found at {path}")
     return path
 
 
