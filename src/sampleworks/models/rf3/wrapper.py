@@ -8,7 +8,12 @@ import numpy as np
 import torch
 from atomworks.enums import ChainType
 from atomworks.ml.samplers import LoadBalancedDistributedSampler
-from biotite.structure import AtomArray, AtomArrayStack
+from atomworks.ml.transforms.featurize_unresolved_residues import (
+    place_unresolved_token_atoms_on_token_representative_atom,
+    place_unresolved_token_on_closest_resolved_token_in_sequence,
+)
+from biotite.sequence import ProteinSequence
+from biotite.structure import AtomArray, AtomArrayStack, concatenate
 from jaxtyping import Float
 from loguru import logger
 from rf3.inference_engines import RF3InferenceEngine
@@ -85,9 +90,9 @@ class RF3Config:
         coordinates into out-of-distribution chiral configurations. Default is False.
     track_chiral_features : bool
         If True, log the chiral gradient L2 norm at each denoising step. The
-        chiral gradient (output of calc_chiral_grads_flat_impl on the
-        EDM scaled coordinates) is the input feature to the model's chiral
-        processing layer. Uses original features when disable_chiral_features is True to
+        chiral gradient (output of calc_chiral_grads_flat_impl on the EDM scaled
+        coordinates) is the input feature to the model's chiral processing layer.
+        Uses original features when disable_chiral_features is True to
         determine if guidance would be breaking them (e.g. magnitude is much larger when guidance
         is on than off). Default is False.
     """
@@ -96,6 +101,112 @@ class RF3Config:
     recycling_steps: int | None = None
     disable_chiral_features: bool = False
     track_chiral_features: bool = False
+
+
+def _add_placeholder_atoms_for_override(
+    atom_array: AtomArray | AtomArrayStack, chain_info: dict
+) -> AtomArray | AtomArrayStack:
+    """Add CA placeholder atoms for unobserved residues from a sequence override.
+
+    When ``apply_sequence_override`` has been applied, the atom array's protein
+    chain has ``seq_idx`` annotations mapping observed atoms to positions in the
+    full override sequence.  Positions absent from the atom array get a single
+    CA atom with NaN coordinates and zero occupancy so RF3's pipeline creates
+    tokens for them.
+
+    Parameters
+    ----------
+    atom_array : AtomArray or AtomArrayStack
+        The structure's atom representation, potentially with ``seq_idx``.
+    chain_info : dict
+        Chain metadata including ``processed_entity_canonical_sequence``.
+
+    Returns
+    -------
+    AtomArray or AtomArrayStack
+        The array with placeholder atoms appended (or unchanged if no override
+        is active).  For ``AtomArrayStack`` inputs, only frame 0 is used;
+        the result is a single-frame stack.
+    """
+    arr = atom_array[0] if isinstance(atom_array, AtomArrayStack) else atom_array
+    if "seq_idx" not in arr.get_annotation_categories():
+        return atom_array
+
+    protein_chains = [
+        (cid, info) for cid, info in chain_info.items() if info["chain_type"].is_protein()
+    ]
+    if not protein_chains:
+        return atom_array
+
+    placeholders: list[AtomArray] = []
+    for chain_id, info in protein_chains:
+        seq = info.get("processed_entity_canonical_sequence", "")
+        if not seq:
+            continue
+        chain_mask = np.asarray(arr.chain_id) == chain_id
+        chain_seq_idx = arr.seq_idx[chain_mask]
+        present = set(int(s) for s in chain_seq_idx)
+        missing = sorted(set(range(len(seq))) - present)
+        if not missing:
+            continue
+
+        # Start from one-based sequence positions, but keep them distinct from
+        # deposited residue IDs. PDB residue numbering is not guaranteed to be
+        # a full-sequence namespace when residues are absent from the structure.
+        observed_res_ids = set(int(r) for r in arr.res_id[chain_mask])
+
+        ref_idx = np.where(chain_mask)[0][0]
+        ref_atom = arr[ref_idx : ref_idx + 1]
+        anno_cats = ref_atom.get_annotation_categories()
+
+        for seq_idx_val in missing:
+            candidate = seq_idx_val + 1
+            while candidate in observed_res_ids:
+                candidate += 1000
+            observed_res_ids.add(candidate)
+
+            aa_3 = ProteinSequence.convert_letter_1to3(seq[seq_idx_val])
+            placeholder = ref_atom.copy()
+            placeholder.atom_name[:] = "CA"
+            placeholder.res_name[:] = aa_3
+            placeholder.res_id[:] = candidate
+            placeholder.element[:] = "C"
+            placeholder.coord[:] = np.nan
+            if "occupancy" in anno_cats:
+                placeholder.occupancy[:] = 0.0
+            if "b_factor" in anno_cats:
+                placeholder.b_factor[:] = 0.0
+            if "seq_idx" in anno_cats:
+                placeholder.seq_idx[:] = seq_idx_val
+            if "hetero" in anno_cats:
+                placeholder.hetero[:] = False
+            if "is_backbone_atom" in anno_cats:
+                setattr(placeholder, "is_backbone_atom", np.array([True], dtype=bool))
+            placeholders.append(placeholder)
+
+    if not placeholders:
+        return atom_array
+
+    result = concatenate([arr] + placeholders)
+
+    # RF3 preserves the input atom order when it builds its model atom array.
+    # Inserted placeholders were appended above, so restore sequence order within
+    # each protein chain while preserving the original atom order within residues.
+    protein_chain_ids = {chain_id for chain_id, info in protein_chains}
+    ordered_indices: list[int] = []
+    for chain_id in dict.fromkeys(np.asarray(result.chain_id).tolist()):
+        chain_indices = np.flatnonzero(np.asarray(result.chain_id) == chain_id)
+        if chain_id in protein_chain_ids:
+            chain_seq_idx = np.asarray(result.seq_idx)[chain_indices]
+            chain_indices = chain_indices[np.argsort(chain_seq_idx, kind="stable")]
+        ordered_indices.extend(chain_indices.tolist())
+    result = result[np.asarray(ordered_indices, dtype=np.int64)]
+
+    if isinstance(atom_array, AtomArrayStack):
+        from biotite.structure import stack
+
+        return stack([result])
+    return result
 
 
 def annotate_structure_for_rf3(
@@ -318,6 +429,9 @@ class RF3Wrapper:
         """From an Atomworks structure, calculate RF3 input features.
 
         Runs the trunk forward pass to produce conditioning features.
+        Any unresolved atoms (NaN coordinates or 0 occupancy) are moved to the
+        coordinates of the nearest resolved atom or token under the
+        coord_to_be_noised annotation.
 
         Parameters
         ----------
@@ -368,6 +482,8 @@ class RF3Wrapper:
         logger.info(f"Using MSA paths: {msa_path}")
 
         chain_info = add_msa_to_chain_info(chain_info, msa_path)
+
+        atom_array = _add_placeholder_atoms_for_override(atom_array, chain_info)
 
         inference_input = InferenceInput.from_atom_array(atom_array, chain_info=chain_info)
 
@@ -442,20 +558,35 @@ class RF3Wrapper:
         # atomworks's add_missing_atoms adds unresolved atoms with
         # occupancy=0.0 and NaN coordinates when we get our atom array with
         # InferenceInput.from_atom_array. RF3 operates on these atoms (they're
-        # in atom_to_token_map), so initialize their coordinates with noise and
-        # set occupancy to 1.0 so they participate in guidance and don't get
-        # masked out in reward functions.
-        nan_coord_mask = np.any(np.isnan(model_aa.coord), axis=-1)
-        if nan_coord_mask.any():
-            resolved_coords = model_aa.coord[~nan_coord_mask]
-            centroid = resolved_coords.mean(axis=0) if len(resolved_coords) > 0 else np.zeros(3)
-            n_nan = int(nan_coord_mask.sum())
-            noise = np.random.normal(loc=0.0, scale=1.0, size=(n_nan, 3)).astype(np.float32)
-            new_coords = model_aa.coord.copy()
-            new_coords[nan_coord_mask] = centroid + noise
-            model_aa.coord = new_coords
+        # in atom_to_token_map), so we need to place these atoms in the
+        # structure so they participate in guidance and don't get
+        # masked out in reward functions. We follow atomworks convention of placing
+        # an unresolved atom on (1) the representative atom for the token, or (2)
+        # the center atom for the token, or (3) the closest neighboring token in
+        # the chain's sequence (defaulting to left token when both are present).
+
+        unresolved_coord_mask = (
+            np.any(np.isnan(model_aa.coord), axis=-1)  # >= 1 NaN coordinate
+            | (model_aa.occupancy <= 0.0)  # 0 occupancy
+        )
+        if unresolved_coord_mask.any():
+            # Place unresolved atoms on resolved atom in the same token,
+            # if possible.
+            model_aa = place_unresolved_token_atoms_on_token_representative_atom(
+                model_aa, annotation_to_update="coord_to_be_noised"
+            )
+
+            # For remaining unresolved atoms, place them on the
+            # closest token in the sequence.
+            model_aa = place_unresolved_token_on_closest_resolved_token_in_sequence(
+                model_aa,
+                annotation_to_update="coord_to_be_noised",
+                annotation_to_copy="coord_to_be_noised",
+            )
+
+            n_nan = int(unresolved_coord_mask.sum())
             logger.info(
-                f"Initialized {n_nan} unresolved atoms with noise "
+                f"Initialized {n_nan} unresolved atoms at nearest atom or token before noising"
                 f"(had NaN coordinates from add_missing_atoms)"
             )
 
