@@ -34,8 +34,10 @@ with (``x_sigma = x_0 + sigma * eps``):
   ``sigma_data^2``, which is exact for Gaussian data ``N(0, sigma_data^2)``.
   Chroma's whitened backbone coordinates have unit scale; all-atom coordinates
   do not.
-- Time is discretized on the Karras sigma schedule (as in ``AF3EDMSampler``)
-  rather than Chroma's uniform grid in ``t``.
+- Time is discretized on the Karras sigma schedule by default (as in
+  ``AF3EDMSampler``). ``p=None`` instead gives the geometric VE discretization
+  of Song et al. (uniform in ``log sigma``), the analogue of Chroma's uniform
+  grid in ``t``.
 
 Not reproduced:
 
@@ -45,23 +47,21 @@ Not reproduced:
 - Chroma's centering. Instead, this sampler centers, randomly rotates and
   aligns to the input exactly like ``AF3EDMSampler``, so that rewards are
   computed in the map frame.
-
-``sde_mode="legacy"`` is the original simplified update. It does not follow
-Chroma: its noise is not scaled by ``sigma`` and has no matching pull toward
-``x_hat_0``.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Literal, TYPE_CHECKING
+from dataclasses import dataclass, fields
+from typing import Any, Literal, TYPE_CHECKING
 
 import einx
 import torch
 from jaxtyping import Float
 from loguru import logger
 
+from sampleworks.core.samplers.edm import EDMSamplerConfig
 from sampleworks.core.samplers.protocol import SamplerSchedule, SamplerStepOutput, StepParams
 from sampleworks.models.protocol import FlowModelWrapper, GenerativeModelInput
 from sampleworks.utils.frame_transforms import (
@@ -74,6 +74,8 @@ from sampleworks.utils.frame_transforms import (
 from sampleworks.utils.framework_utils import match_batch
 
 
+_SCHEDULE_FIELDS = ("sigma_data", "s_max", "s_min", "p")
+
 if TYPE_CHECKING:
     from sampleworks.core.scalers.protocol import StepScalerProtocol
 
@@ -82,10 +84,10 @@ if TYPE_CHECKING:
 class LangevinSchedule(SamplerSchedule):
     """Noise schedule for :class:`AnnealedLangevinSampler`.
 
-    Uses the same Karras/EDM sigma(t) formula as ``EDMSchedule`` -- AF3-family
-    model wrappers were trained under this noise convention, so the annealing
-    schedule must match it regardless of the reverse-time update rule used
-    once the model is queried.  Unlike ``EDMSchedule``, there is no
+    A discretization of the same VE noise process the AF3-family wrappers were
+    trained on: the Karras/EDM sigma(t) formula of ``EDMSchedule`` by default,
+    or geometric spacing in sigma (see ``LangevinSamplerConfig.p``).  Unlike
+    ``EDMSchedule``, there is no
     ``gamma``/churn re-noising step: stochasticity comes entirely from the
     Langevin diffusion term added in ``AnnealedLangevinSampler.step()``, so
     the model is queried directly at ``sigma_tm`` each step (``t_hat ==
@@ -111,8 +113,11 @@ class LangevinSamplerConfig:
     r"""Config for the Annealed Langevin SDE sampler.
 
     The ``sigma_data``/``s_max``/``s_min``/``p`` schedule parameters have the
-    same meaning as in ``EDMSamplerConfig`` and should normally be left at
-    their defaults so the schedule matches what the model was trained on.
+    same meaning as in ``EDMSamplerConfig``. ``sigma_data`` should match what
+    the model was trained on; ``s_max``/``s_min``/``p`` only choose how the
+    same VE noise process is discretized. The defaults are the EDM values;
+    :meth:`with_edm_schedule` and :meth:`with_geometric_schedule` build a
+    config on either discretization explicitly.
 
     Parameters
     ----------
@@ -124,27 +129,31 @@ class LangevinSamplerConfig:
     s_min
         Lower bound of the noise schedule (ending noise level).
     p
-        Exponent (``rho`` in Karras et al.) controlling schedule spacing.
+        Exponent (``rho`` in Karras et al.) controlling schedule spacing. The
+        default 7.0 matches ``AF3EDMSampler``. ``None`` (or ``math.inf``)
+        gives geometric spacing, ``sigma = sigma_data * exp(lerp(log s_max,
+        log s_min, t))``: uniform in ``log sigma``, the VE discretization of
+        Song et al. and the ``rho -> inf`` limit of the Karras formula.
     inverse_temperature
         Scales the score's contribution to the drift term (Chroma's
         parameter of the same name). Above 1.0 biases sampling toward
         higher-likelihood, lower-diversity structures; 1.0 is unscaled.
     langevin_factor
-        Strength of the Langevin (Brownian) noise injected on top of the
-        deterministic drift (Chroma's parameter of the same name). ``0.0``
-        is a deterministic Euler step; positive values make it a true SDE.
+        Number of equilibrating Langevin units added on top of the base
+        dynamics (Chroma's parameter of the same name, ``psi`` in its
+        supplement). ``0.0`` adds none: ``"reverse_sde"`` is then the plain
+        reverse-time SDE and ``"ode"`` the deterministic probability-flow ODE.
     sde_mode
-        ``"legacy"`` (default): the original two-knob update, where
-        ``inverse_temperature`` scales the drift and ``langevin_factor`` scales
-        noise of size ``sqrt(|step_scale * dt|)``. ``"reverse_sde"``,
-        ``"langevin"``, ``"ode"``: Chroma's ``sde_funcs`` of the same names,
-        rewritten for the VE schedule (alpha=1, beta=0, g^2 dt = d(sigma^2)).
-        All three share one update, ``x + dt * c * (delta + guidance) +
-        sqrt(n) * sqrt(2 sigma |dt|) * z``, built from an optional
-        probability-flow ODE term plus ``n`` Langevin units (see
-        ``_sde_drift_and_units``). ``"langevin"`` requires
-        ``langevin_factor > 0`` and ``"ode"`` requires ``langevin_factor == 0``.
-        ``step_scale`` is not applied in these modes.
+        ``"reverse_sde"`` (default), ``"langevin"`` or ``"ode"``: Chroma's
+        ``sde_funcs`` of the same names, rewritten for the VE schedule
+        (alpha=1, beta=0, g^2 dt = d(sigma^2)). ``"reverse_sde"`` with
+        ``langevin_factor > 0`` is the Hybrid Langevin SDE and ``"langevin"``
+        the Annealed Langevin SDE of the Chroma supplement (C.3, C.2). All
+        three share one update, ``x + dt * c * (delta + guidance) + sqrt(n) *
+        sqrt(2 sigma |dt|) * z``, built from an optional probability-flow ODE
+        term plus ``n`` Langevin units (see ``_sde_drift_and_units``).
+        ``"langevin"`` requires ``langevin_factor > 0`` and ``"ode"`` requires
+        ``langevin_factor == 0``.
     align_xt_to_x0
         Rigidly align the noisy state onto the denoised prediction before the
         update (same operation as ``EDMSamplerConfig.alignment_reverse_diffusion``).
@@ -159,13 +168,10 @@ class LangevinSamplerConfig:
         ``integrate_funcs``. ``"heun"`` follows ``chroma.layers.sde.
         sde_integrate_heun``: it re-evaluates the drift at the Euler prediction
         at the same noise level, reuses the same noise draw, and averages the
-        two drifts, so it costs two model calls per step. Requires one of the
-        Chroma ``sde_mode`` values (not ``"legacy"``) and ``align_to_input``,
-        since each evaluation draws its own random augmentation and only the
-        alignment to the input puts both drifts in the same frame.
-    step_scale
-        Multiplier on the Euler step size, matching ``EDMSamplerConfig``.
-        Only used when ``sde_mode="legacy"``.
+        two drifts, so it costs two model calls per step. Requires
+        ``align_to_input``, since each evaluation draws its own random
+        augmentation and only the alignment to the input puts both drifts in
+        the same frame.
     augmentation
         Whether to apply random SO(3) rotation augmentation before each
         denoising step, matching ``EDMSamplerConfig``.
@@ -183,22 +189,21 @@ class LangevinSamplerConfig:
     sigma_data: float = 16.0
     s_max: float = 160.0
     s_min: float = 4e-4
-    p: float = 7.0
+    p: float | None = 7.0
     inverse_temperature: float = 1.0
     langevin_factor: float = 0.0
-    sde_mode: Literal["legacy", "reverse_sde", "langevin", "ode"] = "legacy"
+    sde_mode: Literal["reverse_sde", "langevin", "ode"] = "reverse_sde"
     align_xt_to_x0: bool = False
     temper_guidance: bool = True
     integrate_func: Literal["euler_maruyama", "heun"] = "euler_maruyama"
-    step_scale: float = 1.5
     augmentation: bool = True
     align_to_input: bool = True
     scale_guidance_to_diffusion: bool = True
     device: str | torch.device = "cpu"
 
     def __post_init__(self) -> None:
-        if self.p == 0:
-            raise ValueError("p must be nonzero (used as exponent denominator in schedule formula)")
+        if self.p is not None and self.p <= 0:
+            raise ValueError(f"p ({self.p}) must be positive, or None for geometric spacing")
         if self.s_max <= 0 or self.s_min <= 0:
             raise ValueError(f"s_max ({self.s_max}) and s_min ({self.s_min}) must be positive")
         if self.s_min >= self.s_max:
@@ -209,9 +214,9 @@ class LangevinSamplerConfig:
             raise ValueError(f"inverse_temperature ({self.inverse_temperature}) must be positive")
         if self.langevin_factor < 0:
             raise ValueError(f"langevin_factor ({self.langevin_factor}) must be non-negative")
-        if self.sde_mode not in ("legacy", "reverse_sde", "langevin", "ode"):
+        if self.sde_mode not in ("reverse_sde", "langevin", "ode"):
             raise ValueError(
-                f"sde_mode ({self.sde_mode}) must be 'legacy', 'reverse_sde', 'langevin' or 'ode'"
+                f"sde_mode ({self.sde_mode}) must be 'reverse_sde', 'langevin' or 'ode'"
             )
         if self.sde_mode == "langevin" and self.langevin_factor == 0:
             raise ValueError("sde_mode='langevin' has no drift or noise when langevin_factor=0")
@@ -221,13 +226,55 @@ class LangevinSamplerConfig:
             raise ValueError(
                 f"integrate_func ({self.integrate_func}) must be 'euler_maruyama' or 'heun'"
             )
-        if self.integrate_func == "heun" and self.sde_mode == "legacy":
-            raise ValueError("integrate_func='heun' requires a Chroma sde_mode, not 'legacy'")
         if self.integrate_func == "heun" and not self.align_to_input:
             raise ValueError(
                 "integrate_func='heun' requires align_to_input=True so both drift "
                 "evaluations share the input frame"
             )
+
+    @classmethod
+    def with_edm_schedule(cls, **overrides: Any) -> LangevinSamplerConfig:
+        """Build a config on the Karras schedule of ``AF3EDMSampler``.
+
+        The schedule fields (``sigma_data``, ``s_max``, ``s_min``, ``p``) are
+        read from the ``EDMSamplerConfig`` defaults, so the two samplers share
+        one source of truth.
+
+        Parameters
+        ----------
+        **overrides
+            Any ``LangevinSamplerConfig`` field, including the schedule fields.
+
+        Returns
+        -------
+        LangevinSamplerConfig
+            Config on the EDM discretization unless ``overrides`` change it.
+        """
+        edm_schedule = {
+            field.name: field.default
+            for field in fields(EDMSamplerConfig)
+            if field.name in _SCHEDULE_FIELDS
+        }
+        return cls(**{**edm_schedule, **overrides})
+
+    @classmethod
+    def with_geometric_schedule(cls, **overrides: Any) -> LangevinSamplerConfig:
+        """Build a config on the geometric (Song et al. VE) discretization.
+
+        Keeps the EDM ``sigma_data``/``s_max``/``s_min`` endpoints and sets
+        ``p=None``, so sigma is uniform in ``log sigma`` between them.
+
+        Parameters
+        ----------
+        **overrides
+            Any ``LangevinSamplerConfig`` field, e.g. other endpoints.
+
+        Returns
+        -------
+        LangevinSamplerConfig
+            Config on the geometric discretization unless ``overrides`` set ``p``.
+        """
+        return cls.with_edm_schedule(**{"p": None, **overrides})
 
 
 class AnnealedLangevinSampler:
@@ -239,9 +286,10 @@ class AnnealedLangevinSampler:
     temperature-scaled score-following drift with an injected Langevin
     diffusion term instead of Heun's second-order ODE step.
 
-    ``langevin_factor=0.0`` recovers a purely deterministic, temperature-
-    scaled Euler step; increasing it adds stochastic Langevin noise on top,
-    analogous to Chroma's parameter of the same name.
+    With the default ``sde_mode="reverse_sde"``, ``inverse_temperature=1`` and
+    ``langevin_factor=0`` this is the plain reverse-time SDE; increasing
+    ``langevin_factor`` adds equilibrating Langevin dynamics on top, as in
+    Chroma's parameter of the same name.
 
     Notes
     -----
@@ -294,14 +342,23 @@ class AnnealedLangevinSampler:
     def compute_schedule(self, num_steps: int) -> LangevinSchedule:
         r"""Compute the sigma-based annealing schedule.
 
-        Uses the same formula as ``AF3EDMSampler.compute_schedule()``:
+        With a finite ``p``, uses the same formula as
+        ``AF3EDMSampler.compute_schedule()``:
 
         .. math::
 
             \sigma = \sigma_{\text{data}} \cdot
             \left(s_{\max}^{1/p} + t \cdot (s_{\min}^{1/p} - s_{\max}^{1/p})\right)^p
 
-        with no churn/re-noising step (``t_hat == sigma_tm``), since
+        With ``p`` None or infinite, uses its ``p -> inf`` limit, geometric
+        spacing (the VE discretization of Song et al.):
+
+        .. math::
+
+            \sigma = \sigma_{\text{data}} \cdot
+            \exp\left((1 - t) \log s_{\max} + t \log s_{\min}\right)
+
+        Either way there is no churn/re-noising step (``t_hat == sigma_tm``), since
         stochasticity here comes from the Langevin diffusion term in
         ``step()`` rather than from re-noising between steps.
 
@@ -317,19 +374,24 @@ class AnnealedLangevinSampler:
             ``dt`` arrays.
         """
         t_values = torch.linspace(0, 1, num_steps + 1, device=self.config.device)
+        p = self.config.p
 
-        sigmas = (
-            self.config.sigma_data
-            * (
-                self.config.s_max ** (1 / self.config.p)
-                + t_values
-                * (
-                    self.config.s_min ** (1 / self.config.p)
-                    - self.config.s_max ** (1 / self.config.p)
-                )
+        if p is None or math.isinf(p):
+            log_sigmas = torch.lerp(
+                torch.full_like(t_values, math.log(self.config.s_max)),
+                torch.full_like(t_values, math.log(self.config.s_min)),
+                t_values,
             )
-            ** self.config.p
-        )
+            sigmas = self.config.sigma_data * torch.exp(log_sigmas)
+        else:
+            sigmas = (
+                self.config.sigma_data
+                * (
+                    self.config.s_max ** (1 / p)
+                    + t_values * (self.config.s_min ** (1 / p) - self.config.s_max ** (1 / p))
+                )
+                ** p
+            )
 
         sigma_tm = sigmas[:-1]
         sigma_t = sigmas[1:]
@@ -701,23 +763,13 @@ class AnnealedLangevinSampler:
         beta = self.config.inverse_temperature
         guidance_beta = beta if self.config.temper_guidance else 1.0
 
-        if self.config.sde_mode == "legacy":
-            # Temperature-scaled deterministic drift, plus injected Langevin diffusion noise.
-            step_size = self.config.step_scale * dt  # ty: ignore[unsupported-operator]
-            drift_update = step_size * (beta * delta + guidance_beta * guidance_term)
-            noise_scale = self.config.langevin_factor * torch.sqrt(
-                torch.abs(torch.as_tensor(step_size))
-            )
-        else:
-            # VE form of Chroma's sde_funcs: g^2 dt = 2 sigma dsigma, score = -delta / sigma.
-            sigma = torch.as_tensor(t_hat)
-            dsigma = torch.as_tensor(dt)
-            prior_coefficient, num_langevin_units = self._sde_drift_and_units(beta, sigma)
-            guidance_coefficient, _ = self._sde_drift_and_units(guidance_beta, sigma)
-            drift_update = dsigma * (
-                prior_coefficient * delta + guidance_coefficient * guidance_term
-            )
-            noise_scale = num_langevin_units**0.5 * torch.sqrt(2.0 * sigma * torch.abs(dsigma))
+        # VE form of Chroma's sde_funcs: g^2 dt = 2 sigma dsigma, score = -delta / sigma.
+        sigma = torch.as_tensor(t_hat)
+        dsigma = torch.as_tensor(dt)
+        prior_coefficient, num_langevin_units = self._sde_drift_and_units(beta, sigma)
+        guidance_coefficient, _ = self._sde_drift_and_units(guidance_beta, sigma)
+        drift_update = dsigma * (prior_coefficient * delta + guidance_coefficient * guidance_term)
+        noise_scale = num_langevin_units**0.5 * torch.sqrt(2.0 * sigma * torch.abs(dsigma))
 
         return (
             noisy_state_working_frame_t,
