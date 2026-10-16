@@ -39,7 +39,8 @@ by ``exp(+blur / (4 d^2))`` after the FFT, which leaves ``F(hkl)`` unchanged in
 exact arithmetic and changes only the sampling. lunus measures R = 0.186 against
 direct summation at B_iso = 2 with no blur and 0.0004 with blur = 20 (7FPV,
 0.633 Å grid, d_min 2.0 Å). The correction amplifies sampling error, more at
-high resolution, so :func:`recommended_blur` sizes it to the grid spacing.
+high resolution, so lunus's ``recommended_blur`` sizes it to the grid's largest
+voxel edge and no further.
 
 The taper smooths the cutoff. Both engines truncate each atom's density below a
 threshold (lunus's kernel default, 1e-5 e/Å³, is also gemmi's). lunus converts
@@ -65,12 +66,17 @@ from lunus.sf import (
     build_grid_ops,
     grid_shape_for_resolution,
     orth_matrix,
+    SolventModel,
+    splat_density,
     structure_factors_batch,
+    symmetrize_sum,
 )
+from lunus.sf.cell_utils import recommended_blur
 
 from sampleworks.core.forward_models.xray.real_space_density_deps.qfit.unitcell import (
     UnitCell,
 )
+from sampleworks.synthetic.synthetic_utils import atomarray_to_gemmi
 from sampleworks.utils.elements import normalize_element
 
 
@@ -81,43 +87,6 @@ if TYPE_CHECKING:
 # gemmi's default sampling rate for density grids; lunus's grid_shape_for_resolution
 # takes the same convention (spacing = d_min / (2 * rate)).
 DEFAULT_GRID_RATE = 1.5
-
-# Effective B at which an atom's Gaussian has width sigma = one grid spacing:
-# sigma^2 = B / (8 pi^2). Checked on 6B8X at d_min 2.2 A against a rate 4.5,
-# no-blur grid: the default rate 1.5 gives R 0.1007 with no blur and 0.00004 with
-# the recommended 40.5. gemmi's Refmac-compatible rule gives effective B 25.8-46.2
-# on 6B8X and 1VME at 1.8-2.2 A.
-B_TARGET_COEFFICIENT = 8.0 * np.pi**2
-
-
-def recommended_blur(
-    b_factors: np.ndarray, resolution: float, rate: float = DEFAULT_GRID_RATE
-) -> float:
-    """Smallest blur that samples the sharpest atom adequately on the grid.
-
-    Raises the minimum B to :data:`B_TARGET_COEFFICIENT` times the squared grid
-    spacing. The sharpest atom sets the requirement; the blur is kept minimal
-    because it is divided back out with ``exp(+blur / (4 d^2))``, which amplifies
-    sampling error.
-
-    Parameters
-    ----------
-    b_factors
-        Per-atom B-factors, Å².
-    resolution
-        High-resolution limit (d_min) in Å.
-    rate
-        Grid oversampling rate; spacing is ``d_min / (2 * rate)``.
-
-    Returns
-    -------
-    float
-        Blur to add, Å². Zero when the sharpest atom is already smooth enough.
-    """
-    spacing = resolution / (2.0 * rate)
-    b_target = B_TARGET_COEFFICIENT * spacing**2
-    b_min = float(np.min(np.asarray(b_factors, dtype=np.float64)))
-    return max(0.0, b_target - b_min)
 
 
 def space_group_operations(
@@ -302,8 +271,9 @@ def build_setup(
         Grid oversampling rate; spacing is ``d_min / (2 * rate)``.
     blur
         Extra isotropic B for grid sampling, divided back out in the FFT.
-        ``None`` takes :func:`recommended_blur`. ``0.0`` disables it, which is
-        only safe when no atom is sharp relative to the grid spacing.
+        ``None`` takes lunus's ``recommended_blur`` for the sharpest atom on this
+        grid. ``0.0`` disables it, which is only safe when no atom is sharp
+        relative to the grid spacing.
     device, dtype
         Torch placement for the kernel tensors.
 
@@ -375,7 +345,7 @@ def build_setup(
     grid_ops = build_grid_ops(rotations, translations, grid_shape)
 
     if blur is None:
-        blur = recommended_blur(b_factors, resolution, rate)
+        blur = recommended_blur(float(np.min(b_factors)), grid_shape, orth_np, d_min=resolution)
         if blur > 0.0:
             logger.info(
                 f"Blur {blur:.1f} A^2 added for grid sampling: the sharpest atom is at "
@@ -507,3 +477,117 @@ def structure_factors(
         use_checkpoint=use_checkpoint,
         solvent=solvent,
     )
+
+
+def geometric_solvent_fraction(
+    atom_array: AtomArray,
+    coords: np.ndarray,
+    unit_cell: gemmi.UnitCell,
+    space_group: str | gemmi.SpaceGroup,
+    grid_shape: tuple[int, int, int],
+    radii_set: str = "Refmac",
+) -> float:
+    """Fraction of the cell that gemmi's geometric solvent mask calls solvent.
+
+    The calibration target for :func:`calibrate_solvent`: the conventional
+    (van der Waals radius plus probe, then shrink) mask on the same atoms and
+    grid, so the threshold mask is tuned to call the same volume solvent.
+
+    Parameters
+    ----------
+    atom_array
+        Topology, converted with ``atomarray_to_gemmi`` as the structure-factor
+        reward does; its own coordinates are replaced by ``coords``.
+    coords
+        ``(n_atoms, 3)`` Cartesian coordinates in Å for one configuration.
+    unit_cell, space_group
+        Crystal metadata.
+    grid_shape
+        ``(Nu, Nv, Nw)`` grid the mask is evaluated on, normally the setup's.
+    radii_set
+        A ``gemmi.AtomicRadiiSet`` name.
+
+    Returns
+    -------
+    float
+        Solvent fraction in ``[0, 1]``.
+    """
+    with_coords = atom_array.copy()
+    with_coords.coord = np.asarray(coords, dtype=np.float32)
+    hm = space_group if isinstance(space_group, str) else space_group.hm
+    model = atomarray_to_gemmi(with_coords, unit_cell, hm)[0]
+
+    grid = gemmi.FloatGrid()
+    grid.set_size(*grid_shape)
+    grid.set_unit_cell(unit_cell)
+    grid.spacegroup = gemmi.SpaceGroup(space_group) if isinstance(space_group, str) else space_group
+    gemmi.SolventMasker(getattr(gemmi.AtomicRadiiSet, radii_set)).put_mask_on_float_grid(
+        grid, model
+    )
+    return float(np.asarray(grid, dtype=np.float64).mean())
+
+
+def calibrate_solvent(
+    setup: LunusSetup,
+    coords: Float[torch.Tensor, "n_atoms 3"],
+    occupancies: Float[torch.Tensor, " n_atoms"],
+    target_fraction: float,
+    *,
+    taper_width_frac: float = 0.5,
+) -> SolventModel:
+    """A ``SolventModel`` whose cutoff calls ``target_fraction`` of the cell solvent.
+
+    Evaluates the configuration's density on the setup's grid, symmetry-expands
+    it, and runs ``SolventModel.calibrate`` with the setup's blur, so the cutoff
+    is set on the density the mask will see. The matched cutoff depends on the
+    system, its B-factors and the grid, so it is calibrated rather than fixed.
+
+    Parameters
+    ----------
+    setup
+        Built by :func:`build_setup`.
+    coords
+        ``(n_atoms, 3)`` Cartesian coordinates in Å of a representative
+        configuration.
+    occupancies
+        ``(n_atoms,)`` occupancies for that configuration.
+    target_fraction
+        Solvent fraction to match, from :func:`geometric_solvent_fraction`.
+    taper_width_frac
+        Taper width as a fraction of the cutoff, lunus's convention.
+
+    Returns
+    -------
+    SolventModel
+        With ``cutoff`` and ``taper_width`` set; other parameters at lunus defaults.
+    """
+    frac = coords.to(setup.frac_matrix) @ setup.frac_matrix.T
+    with torch.no_grad():
+        density = splat_density(
+            frac,
+            setup.element_idx,
+            occupancies.to(frac),
+            setup.atom_A,
+            setup.atom_lam,
+            setup.elem_offsets,
+            setup.atom_radius_ang,
+            setup.grid_shape,
+            setup.orth_matrix,
+            setup.taper_width,
+        )
+        if setup.grid_ops:
+            density = symmetrize_sum(density, setup.grid_ops)
+        # Placeholders; calibrate() sets both.
+        solvent = SolventModel(cutoff=1.0, taper_width=0.5)
+        solvent.calibrate(
+            density,
+            setup.orth_matrix,
+            target_fraction,
+            taper_width_frac=taper_width_frac,
+            pipeline_blur=setup.blur,
+        )
+    logger.info(
+        f"Solvent cutoff calibrated to {solvent.cutoff:.4g} e/A^3 (taper "
+        f"{solvent.taper_width:.4g}) for a solvent fraction of {target_fraction:.3f}"
+    )
+    return solvent
