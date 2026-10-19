@@ -570,6 +570,9 @@ class Boltz2Wrapper:
 
         self.data_module: Boltz2InferenceDataModule
         self.cached_representations: dict[str, Any] = {}
+        # Which (s, z) tensors the diffusion-conditioning bundle was built from; set by
+        # _build_diffusion_conditioning and compared by identity in step().
+        self._dc_src: tuple[Tensor | None, Tensor | None] = (None, None)
 
     def _setup_data_module(
         self,
@@ -819,7 +822,8 @@ class Boltz2Wrapper:
 
         Boltz2 collapses ``s`` and ``z`` into six coordinate-independent tensors that the
         diffusion module reuses at every denoising step. ``featurize`` computes them once;
-        ``step`` recomputes them when a latent has to stay on the autograd path.
+        ``step`` recomputes them whenever the ``s``/``z`` on the conditioning are not the
+        tensors the bundle was built from (IT-opt swaps in optimized latents).
 
         Parameters
         ----------
@@ -846,6 +850,10 @@ class Boltz2Wrapper:
                 feats=feats,
             )
         )
+
+        # Remember which latent tensors this bundle was derived from, so step() can tell a
+        # stale bundle apart from a fresh one by identity (see the rebuild check there).
+        self._dc_src = (s_trunk, z_trunk)
 
         return {
             "q": q,
@@ -909,10 +917,17 @@ class Boltz2Wrapper:
         else:
             raise ValueError("pad_len is negative, cannot pad x_t")
 
-        # The cached bundle freezes s and z, and the diffusion module reads z only through it.
-        # Rebuild from live latents when one is optimizable, or IT-opt's gradient goes nowhere.
+        # The cached bundle freezes s and z, and the diffusion module reads z only through it, so
+        # it must be rebuilt whenever the latents on the conditioning are not the tensors it was
+        # built from. Identity is the right test, not grad mode: IT-opt's final frozen-latent pass
+        # runs with grad off and detached latents, and gating on grad there silently fed the
+        # featurize-time z to every saved ensemble (verified on 6B8X: the output was bit-identical
+        # with the optimized z swapped back to the trunk baseline). `is not`, never `!=`, which
+        # would compare the tensors elementwise. Ordinary runs keep the featurize-time tensors on
+        # the conditioning, so they never rebuild and pay nothing.
         diffusion_conditioning = cond.diffusion_conditioning
-        if torch.is_grad_enabled() and (cond.s.requires_grad or cond.z.requires_grad):
+        source_s, source_z = self._dc_src
+        if cond.s is not source_s or cond.z is not source_z:
             diffusion_conditioning = self._build_diffusion_conditioning(
                 s_trunk=cond.s,
                 z_trunk=cond.z,
