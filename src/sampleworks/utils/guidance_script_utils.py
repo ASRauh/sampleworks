@@ -4,6 +4,7 @@ import json
 import os
 import pickle
 import traceback
+from collections import Counter
 from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
@@ -14,7 +15,13 @@ import numpy as np
 import torch
 from atomworks.io.transforms.atom_array import ensure_atom_array_stack
 from biotite.database.rcsb import fetch
-from biotite.structure import AtomArray, AtomArrayStack, stack
+from biotite.structure import (
+    AtomArray,
+    AtomArrayStack,
+    get_residue_positions,
+    get_residue_starts,
+    stack,
+)
 from biotite.structure.io.pdbx import CIFFile, set_structure
 from loguru import logger
 
@@ -34,6 +41,7 @@ from sampleworks.eval.occupancy_utils import (
     rcsb_id_from_protein_name,
 )
 from sampleworks.utils.atom_array_utils import parse_structure
+from sampleworks.utils.atom_reconciler import AtomReconciler
 from sampleworks.utils.cif_utils import (
     add_category_to_cif,
     carry_polymer_entity_categories,
@@ -165,6 +173,87 @@ def _write_coords_into_array(
             f"atom array ({n_atoms_array} atoms)"
         )
     array_copy.coord = coords
+
+
+def relabel_model_residues(
+    model_atom_array: AtomArray,
+    struct_atom_array: AtomArray,
+    reconciler: AtomReconciler,
+) -> AtomArray:
+    """Give the model topology the input's residue labels and the B-factors the reward scored.
+
+    Chain, residue number and insertion code come from the input for every model residue with a
+    matched atom. Residues the input lacks (termini or gaps predicted under a sequence override)
+    take the chain and numbering of the nearest matched residue in the same model chain,
+    continuing consecutively. Everything else (atoms, order, names, elements, occupancy) stays
+    the model's, except ``b_factor`` on matched atoms, which is the input's, as in
+    ``SampleworksProcessedStructure.to_reward_inputs``.
+
+    Parameters
+    ----------
+    model_atom_array : AtomArray
+        Model-space topology, ``n_model`` atoms.
+    struct_atom_array : AtomArray
+        Filtered input topology the reconciler was built against, ``n_struct`` atoms.
+    reconciler : AtomReconciler
+        Mapping between the two.
+
+    Returns
+    -------
+    AtomArray
+        Relabeled copy of ``model_atom_array``.
+    """
+    model_idx = reconciler.model_indices.cpu().numpy()  # (n_common,)
+    struct_idx = reconciler.struct_indices.cpu().numpy()  # (n_common,)
+    starts = get_residue_starts(model_atom_array)  # (n_residues,)
+    residue_of_atom = get_residue_positions(  # (n_model,)
+        model_atom_array, np.arange(len(model_atom_array))
+    )
+    residue_chain = model_atom_array.chain_id[starts]  # (n_residues,)
+    matched = residue_of_atom[model_idx]  # (n_common,) residue of each common atom
+
+    # (n_residues,) per-residue model -> input res_id offset, chain and insertion code
+    offset = np.zeros(len(starts), dtype=int)
+    offset[matched] = struct_atom_array.res_id[struct_idx] - model_atom_array.res_id[model_idx]
+    chain = residue_chain.copy()
+    chain[matched] = struct_atom_array.chain_id[struct_idx]
+    ins_code = np.full(len(starts), "", dtype=model_atom_array.ins_code.dtype)
+    ins_code[matched] = struct_atom_array.ins_code[struct_idx]
+
+    # Residues the input lacks (chain ends, or gaps the model built) get residue numbers starting
+    # from their neighbor. Those numbers can clash with the input's own numbers, and such a residue
+    # can take another input chain's label. The duplicate-label warning below reports these cases.
+    for model_chain in np.unique(residue_chain):
+        residues = np.flatnonzero(residue_chain == model_chain)
+        known = residues[np.isin(residues, matched)]
+        if known.size == 0:
+            continue  # chain absent from the input: keep the model's labels
+        # Unmatched residues follow the nearest matched residue before them (else after).
+        nearest = known[np.clip(np.searchsorted(known, residues, side="right") - 1, 0, None)]
+        offset[residues] = offset[nearest]
+        chain[residues] = chain[nearest]
+
+    relabeled = model_atom_array.copy()
+    relabeled.chain_id = chain[residue_of_atom]
+    relabeled.res_id = (model_atom_array.res_id[starts] + offset)[residue_of_atom]
+    relabeled.ins_code = ins_code[residue_of_atom]
+    relabeled.b_factor[model_idx] = struct_atom_array.b_factor[struct_idx]
+    residue_labels = list(
+        zip(
+            chain.tolist(),
+            (model_atom_array.res_id[starts] + offset).tolist(),
+            ins_code.tolist(),
+        )
+    )
+    duplicates = [label for label, count in Counter(residue_labels).items() if count > 1]
+    if duplicates:
+        logger.warning(
+            f"Relabeled output model has duplicate residue labels {duplicates}. These residues "
+            "will be merged together when the CIF is read back into an AtomArray if they are "
+            "adjacent and share a residue name. Otherwise they stay separate but share residue "
+            "name and number labels."
+        )
+    return relabeled
 
 
 def _write_structure_cif(
@@ -826,7 +915,12 @@ def _run_guidance(args: GuidanceConfig, guidance_type: str, model_wrapper, devic
         logger.error(f"Unknown guidance type: {guidance_type}")
         raise TypeError("Unknown guidance type!")
 
-    model_atom_array = result.metadata.get("model_atom_array") if result.metadata else None
+    metadata = result.metadata or {}
+    model_atom_array = metadata.get("model_atom_array")
+    if model_atom_array is not None:
+        model_atom_array = relabel_model_residues(
+            model_atom_array, metadata["struct_atom_array"], metadata["reconciler"]
+        )
 
     save_everything(
         args,
