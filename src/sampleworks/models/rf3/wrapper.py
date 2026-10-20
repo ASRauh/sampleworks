@@ -686,9 +686,15 @@ class RF3Wrapper:
                 # Handle the case where the generator is empty
                 raise RuntimeError("Recycling generator produced no outputs")
 
-        s_inputs = recycling_outputs["S_inputs_I"]
-        s_trunk = recycling_outputs["S_I"]
-        z_trunk = recycling_outputs["Z_II"]
+        # Hand the latents out in float32, not the trunk's bfloat16. The diffusion module casts
+        # them to float on entry anyway, so inference is unchanged; what this protects is latent
+        # optimization, whose Adam leaves are clones of these tensors. In bfloat16 the spacing at
+        # |z| ~ 40 is 0.25 and at |s| ~ 800 is 4, so an Adam step of ~0.05 is rounded away on
+        # most elements (measured on 6DUR: a 0.05 update changes 59% of z and 15% of s in
+        # bfloat16, 100% in float32) and the optimization silently stalls.
+        s_inputs = recycling_outputs["S_inputs_I"].float()
+        s_trunk = recycling_outputs["S_I"].float()
+        z_trunk = recycling_outputs["Z_II"].float()
 
         return {
             "s_inputs": s_inputs,
