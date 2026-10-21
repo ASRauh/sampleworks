@@ -3,6 +3,7 @@
 import pytest
 import torch
 from sampleworks.utils.atom_reconciler import AtomReconciler
+from sampleworks.utils.frame_transforms import random_rotation_matrix
 
 from tests.utils.atom_array_builders import build_test_atom_array
 
@@ -33,6 +34,57 @@ class TestIdentity:
         torch.testing.assert_close(result, coords)
 
 
+class TestAlignmentGradients:
+    """Gradient behavior of align() on the identity reconciler."""
+
+    def test_gradient_flow_through_alignment(self):
+        """Gradients through alignment are rigid-motion invariant when allow_gradients=True.
+
+        Aligned coordinates do not change under a rigid motion of the input, so the
+        gradient of any function of them must exert zero net force and zero net
+        torque on the input. A detached or partially detached transform breaks this.
+        """
+        torch.manual_seed(0)
+        reconciler = AtomReconciler.identity(50)
+        reference = torch.randn(1, 50, 3, dtype=torch.float64)
+        rotation = random_rotation_matrix(reference)
+        noise = 0.3 * torch.randn(reference.shape, dtype=reference.dtype)
+        # (1, n_atoms, 3)
+        model_coords = (
+            (reference @ rotation.transpose(-1, -2) + noise).detach().requires_grad_(True)
+        )
+        # (1, n_atoms, 3), fixed per-coordinate weights so the objective is not symmetric
+        objective_weights = torch.randn(reference.shape, dtype=reference.dtype)
+
+        aligned, _ = reconciler.align(model_coords, reference, allow_gradients=True)
+        assert aligned.requires_grad
+
+        # (1, n_atoms, 3)
+        grad = torch.autograd.grad((aligned * objective_weights).sum(), model_coords)[0]
+        assert torch.isfinite(grad).all()
+        grad_magnitude = grad.norm(dim=-1).sum()
+        assert grad_magnitude > 0
+
+        net_force = grad.sum(dim=-2)
+        lever = model_coords.detach() - model_coords.detach().mean(dim=-2, keepdim=True)
+        net_torque = torch.linalg.cross(lever, grad, dim=-1).sum(dim=-2)
+        torque_magnitude = (lever.norm(dim=-1) * grad.norm(dim=-1)).sum()
+
+        assert net_force.norm() / grad_magnitude < 1e-4
+        assert net_torque.norm() / torque_magnitude < 1e-4
+
+    def test_alignment_detaches_when_gradients_disallowed(self):
+        """allow_gradients=False returns aligned coordinates with no autograd history."""
+        reconciler = AtomReconciler.identity(20)
+        reference = torch.randn(1, 20, 3)
+        # The uniform +1.0 translation means alignment must undo a real transform rather than
+        # return its input unchanged, so the no-grad check is meaningful.
+        model_coords = (reference + 1.0).detach().requires_grad_(True)
+        aligned, _ = reconciler.align(model_coords, reference, allow_gradients=False)
+
+        assert not aligned.requires_grad
+
+
 class TestFromArrays:
     """Construction from model and structure atom arrays."""
 
@@ -57,6 +109,43 @@ class TestFromArrays:
         struct = build_test_atom_array(chain_ids=["B"], res_ids=[0], atom_names=["CA"])
         with pytest.raises(RuntimeError, match="No common atoms"):
             AtomReconciler.from_arrays(model, struct)
+
+    @pytest.mark.parametrize(
+        "chain_ids,res_ids",
+        [(["B"] * 4, [0, 0, 1, 1]), (["A"] * 4, [365, 365, 366, 366])],
+        ids=["chain_only", "res_id_only"],
+    )
+    def test_label_only_difference_requires_reconciliation(self, chain_ids, res_ids):
+        model = build_test_atom_array(
+            chain_ids=["A"] * 4, res_ids=[0, 0, 1, 1], atom_names=["N", "CA"] * 2
+        )
+        struct = build_test_atom_array(
+            chain_ids=chain_ids, res_ids=res_ids, atom_names=["N", "CA"] * 2
+        )
+
+        rec = AtomReconciler.from_arrays(model, struct)
+
+        assert rec.n_common == len(model) == len(struct)
+        # Indices come back id-sorted, so compare them to each other rather than to a range.
+        assert rec.model_indices.tolist() == rec.struct_indices.tolist()
+        assert rec.has_mismatch
+
+    def test_mse_se_maps_to_met_sd(self):
+        model = build_test_atom_array(chain_ids=["A", "A"], res_ids=[0, 0], atom_names=["N", "SD"])
+        model.res_name[:] = "MET"
+        model.element[:] = ["N", "S"]
+        struct = build_test_atom_array(
+            chain_ids=["A", "A"], res_ids=[13, 13], atom_names=["N", "SE"]
+        )
+        struct.res_name[:] = "MSE"
+        struct.element[:] = ["N", "Se"]
+
+        rec = AtomReconciler.from_arrays(model, struct)
+
+        assert rec.has_mismatch
+        assert rec.n_common == len(model) == len(struct)
+        assert rec.model_indices.tolist() == [0, 1]
+        assert rec.struct_indices.tolist() == [0, 1]
 
 
 class TestCoordinateTranslation:

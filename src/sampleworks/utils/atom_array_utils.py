@@ -8,7 +8,9 @@ import einx
 import numpy as np
 from atomworks import parse
 from atomworks.io.transforms.atom_array import ensure_atom_array_stack
+from atomworks.io.utils.ccd import ChainType, UNKNOWN_AA
 from atomworks.io.utils.io_utils import load_any
+from atomworks.io.utils.sequence import get_1_from_3_letter_code, get_3_from_1_letter_code
 from biotite.structure import AtomArray, AtomArrayStack, filter_amino_acids, filter_polymer, stack
 from biotite.structure.io.pdbx import CIFFile, set_structure
 from loguru import logger
@@ -74,21 +76,26 @@ def parse_selection_string(selection: str) -> tuple[str | None, int | None, int 
     return chain, resi_start, resi_end
 
 
-def apply_selection(atom_array: AtomArray, selection: str | None) -> AtomArray:
+def apply_selection(
+    atom_array: AtomArray | AtomArrayStack, selection: str | None
+) -> AtomArray | AtomArrayStack:
     """Apply an atom selection string to filter a structure.
 
     Parameters
     ----------
     atom_array
-        Structure to filter
+        Structure to filter. A stack is filtered along its atom axis, leaving
+        every model in place: per-atom annotations are shared across models, so
+        one mask describes them all.
     selection
         Selection string (e.g., 'chain A and resi 10-50'). If None, returns
         the entire structure unchanged.
 
     Returns
     -------
-    AtomArray
-        Filtered structure containing only atoms matching the selection
+    AtomArray | AtomArrayStack
+        Filtered structure containing only atoms matching the selection, of the
+        same type as the input.
 
     Raises
     ------
@@ -103,6 +110,11 @@ def apply_selection(atom_array: AtomArray, selection: str | None) -> AtomArray:
     else:
         mask = atom_array.mask(selection)
 
+    # A stack's first axis is models, so a bare `[mask]` would select models by
+    # an atom-length boolean and raise. Both mask builders above already accept
+    # a stack; only the indexing has to know the difference.
+    if isinstance(atom_array, AtomArrayStack):
+        return cast(AtomArrayStack, atom_array[:, mask])
     return cast(AtomArray, atom_array[mask])
 
 
@@ -156,15 +168,15 @@ def parse_structure(path: str | Path) -> dict[str, Any]:
     )
 
 
-def load_structure_with_altlocs(path: Path) -> AtomArray:
+def load_structure_with_altlocs(path: Path, model: int = 0) -> AtomArray:
     """Load a structure file with alternate conformations and occupancy data.
-
-    Takes the first model if multiple models are present.
 
     Parameters
     ----------
     path
         Path to the structure file (PDB, mmCIF, etc.)
+    model
+        0-based index of the model to take if multiple models are present.
 
     Returns
     -------
@@ -174,7 +186,7 @@ def load_structure_with_altlocs(path: Path) -> AtomArray:
     # Currently, we need to specify extra_fields=["occupancy"] to load altlocs properly
     atom_array = load_any(path, altloc="all", extra_fields=["occupancy", "b_factor"])
     if isinstance(atom_array, AtomArrayStack):
-        atom_array = cast(AtomArray, atom_array[0])
+        atom_array = cast(AtomArray, atom_array[model])
     return atom_array
 
 
@@ -388,13 +400,15 @@ def map_altlocs_to_stack(
 
     Returns
     -------
-    tuple[AtomArrayStack, np.ndarray, np.ndarray]
+    tuple[AtomArrayStack, dict[str, np.ndarray]]
         Tuple containing:
 
-        - AtomArrayStack with separate structures for each altloc.
-        - Dictionary of extra annotations that are removed to avoid conflicts, currently
-          'occupancy', 'altloc_id', and 'b_factor'. Each is returned as
-          n_altloc x n_res numpy arrays
+        - AtomArrayStack with separate structures for each altloc. Note that the
+          annotations below are *absent* from it, having been deleted to let the
+          structures stack.
+        - Dictionary of the extra annotations that are removed to avoid conflicts,
+          currently 'occupancy', 'altloc_id', and 'b_factor'. Each is returned as an
+          ``(n_altloc, n_atoms)`` numpy array, indexed by the stack's atom order.
     """
     if isinstance(atom_array, AtomArrayStack):
         if len(atom_array) > 1:
@@ -929,3 +943,26 @@ def build_pairwise_altloc_arrays(
                 continue
             pairs[(altloc_ids[i], altloc_ids[j])] = (f_i, f_j)
     return pairs
+
+
+def _closest_canonical_amino_acid(res_name: str) -> str | None:
+    """Map a (possibly modified) residue name to its canonical parent amino acid.
+
+    Uses atomworks' mapping, e.g. ``CSO -> CYS``, ``MSE -> MET``. Standard amino
+    acids map to themselves and "residues" with no amino-acid (ligands, waters) return ``None``.
+
+    Parameters
+    ----------
+    res_name : str
+        Three letter amino acid name.
+
+    Returns
+    -------
+    str | None
+        Canonical three letter amino acid name, or ``None`` if HETATM.
+    """
+    one_letter = get_1_from_3_letter_code(
+        res_name, ChainType.POLYPEPTIDE_L, use_closest_canonical=True
+    )
+    parent = get_3_from_1_letter_code(one_letter, ChainType.POLYPEPTIDE_L)
+    return None if parent == UNKNOWN_AA else parent
