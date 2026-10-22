@@ -46,11 +46,9 @@ class RF3Conditioning:
     s_inputs : Tensor
         Input embeddings (S_inputs_I).
     s_trunk : Tensor
-        Single representation from trunk (S_I). With ``z_trunk``, this is what inference-time
-        latent optimization optimizes; ``AttrLatentIO`` addresses it by this attribute name
-        (see ``models/latent_adapter.py``).
+        Single representation from trunk (S_I).
     z_trunk : Tensor
-        Pair representation from trunk (Z_II). See ``s_trunk``.
+        Pair representation from trunk (Z_II).
     features : dict[str, Any]
         Raw feature dict (f tensor).
     true_atom_array : AtomArray | None
@@ -686,12 +684,8 @@ class RF3Wrapper:
                 # Handle the case where the generator is empty
                 raise RuntimeError("Recycling generator produced no outputs")
 
-        # Hand the latents out in float32, not the trunk's bfloat16. The diffusion module casts
-        # them to float on entry anyway, so inference is unchanged; what this protects is latent
-        # optimization, whose Adam leaves are clones of these tensors. In bfloat16 the spacing at
-        # |z| ~ 40 is 0.25 and at |s| ~ 800 is 4, so an Adam step of ~0.05 is rounded away on
-        # most elements (measured on 6DUR: a 0.05 update changes 59% of z and 15% of s in
-        # bfloat16, 100% in float32) and the optimization silently stalls.
+        # Hand the latents out in float32, not the trunk's bfloat16: latent optimization clones
+        # them as Adam leaves, and in bfloat16 an Adam step of ~0.05 rounds away on most elements.
         s_inputs = recycling_outputs["S_inputs_I"].float()
         s_trunk = recycling_outputs["S_I"].float()
         z_trunk = recycling_outputs["Z_II"].float()

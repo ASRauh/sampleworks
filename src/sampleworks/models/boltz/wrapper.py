@@ -283,11 +283,8 @@ class BoltzConditioning:
         Relative position encoding tensor.
     feats : dict[str, Any]
         Raw batch dict from dataloader.
-    diffusion_conditioning : dict[str, Any] | None
-        Boltz2 only. The bundle ``DiffusionModule.forward`` indexes: ``q``, ``c``,
-        ``to_keys``, ``atom_enc_bias``, ``atom_dec_bias``, ``token_trans_bias``. The values
-        are not all tensors -- ``to_keys`` is a windowing closure over the atom-attention
-        index matrix -- so the value type is ``Any``.
+    diffusion_conditioning : dict[str, Tensor] | None
+        Additional diffusion conditioning (Boltz2 only).
     true_atom_array : AtomArray | None
         Original structure's atom array (occupancy-filtered) for reward computation.
         Boltz's internal atom representation may differ from this due to padding, etc.
@@ -302,7 +299,7 @@ class BoltzConditioning:
     s_inputs: Tensor
     relative_position_encoding: Tensor
     feats: dict[str, Any]
-    diffusion_conditioning: dict[str, Any] | None = None
+    diffusion_conditioning: dict[str, Tensor] | None = None
     true_atom_array: AtomArray | None = None
     model_atom_array: AtomArray | None = None
 
@@ -570,8 +567,7 @@ class Boltz2Wrapper:
 
         self.data_module: Boltz2InferenceDataModule
         self.cached_representations: dict[str, Any] = {}
-        # Which (s, z) tensors the diffusion-conditioning bundle was built from; set by
-        # _build_diffusion_conditioning and compared by identity in step().
+        # The (s, z) the diffusion-conditioning bundle was built from; checked in step().
         self._dc_src: tuple[Tensor | None, Tensor | None] = (None, None)
 
     def _setup_data_module(
@@ -820,10 +816,8 @@ class Boltz2Wrapper:
     ) -> dict[str, Any]:
         """Derive the diffusion module's conditioning bundle from the trunk latents.
 
-        Boltz2 collapses ``s`` and ``z`` into six coordinate-independent tensors that the
-        diffusion module reuses at every denoising step. ``featurize`` computes them once;
-        ``step`` recomputes them whenever the ``s``/``z`` on the conditioning are not the
-        tensors the bundle was built from (IT-opt swaps in optimized latents).
+        Boltz2 collapses ``s`` and ``z`` into six coordinate-independent tensors the diffusion
+        module reuses at every denoising step.
 
         Parameters
         ----------
@@ -839,8 +833,7 @@ class Boltz2Wrapper:
         Returns
         -------
         dict[str, Any]
-            The six entries ``DiffusionModule.forward`` indexes. ``to_keys`` is a closure,
-            not a tensor.
+            The six entries ``DiffusionModule.forward`` indexes.
         """
         q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
             self.model.diffusion_conditioning(
@@ -851,8 +844,6 @@ class Boltz2Wrapper:
             )
         )
 
-        # Remember which latent tensors this bundle was derived from, so step() can tell a
-        # stale bundle apart from a fresh one by identity (see the rebuild check there).
         self._dc_src = (s_trunk, z_trunk)
 
         return {
@@ -917,14 +908,8 @@ class Boltz2Wrapper:
         else:
             raise ValueError("pad_len is negative, cannot pad x_t")
 
-        # The cached bundle freezes s and z, and the diffusion module reads z only through it, so
-        # it must be rebuilt whenever the latents on the conditioning are not the tensors it was
-        # built from. Identity is the right test, not grad mode: IT-opt's final frozen-latent pass
-        # runs with grad off and detached latents, and gating on grad there silently fed the
-        # featurize-time z to every saved ensemble (verified on 6B8X: the output was bit-identical
-        # with the optimized z swapped back to the trunk baseline). `is not`, never `!=`, which
-        # would compare the tensors elementwise. Ordinary runs keep the featurize-time tensors on
-        # the conditioning, so they never rebuild and pay nothing.
+        # The bundle is derived from s and z, so rebuild it whenever the latents on the
+        # conditioning are not the ones it was built from. IT-opt swaps in optimized latents.
         diffusion_conditioning = cond.diffusion_conditioning
         source_s, source_z = self._dc_src
         if cond.s is not source_s or cond.z is not source_z:
