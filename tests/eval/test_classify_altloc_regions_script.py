@@ -5,11 +5,16 @@ Unit tests for ``scripts/eval/classify_altloc_regions.py``.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import pandas as pd
 import pytest
+from atomworks.io.utils.io_utils import load_any
+from sampleworks.utils.atom_array_utils import detect_altlocs, load_structure_with_altlocs
 from sampleworks.utils.cif_utils import find_altloc_selections
+
+from tests.utils.atom_array_builders import altlocs_to_ensemble_cif
 
 from .script_loader import load_script
 
@@ -72,3 +77,65 @@ def test_union_selection_is_not_classified(tmp_path: Path, resources_dir: Path, 
 
     df = pd.read_csv(output_file)
     assert df["selection"].tolist() == spans
+
+
+@pytest.mark.parametrize("metric", ["lddt", "rmsd"])
+def test_ensemble_classification_matches_single_model(
+    tmp_path: Path, resources_dir: Path, metric: str, classify_script
+) -> None:
+    """A two-altloc structure rewritten as a 2-model ensemble gets the same classifications.
+
+    Parameters
+    ----------
+    tmp_path
+        Directory for the ensemble CIF.
+    resources_dir
+        Test resources root.
+    metric
+        Loop scoring metric.
+    classify_script
+        The script module.
+    """
+    scorer = classify_script.LOOP_SCORERS[metric]
+    cif_path = resources_dir / "1vme" / "1vme_final_carved_edited_0.5occA_0.5occB.cif"
+    ensemble_path = altlocs_to_ensemble_cif(cif_path, tmp_path / "ensemble.cif")
+    # The fixture has exactly altlocs A and B, so the ensemble has two models and each side has
+    # one conformer pair: A-B and model_0-model_1.
+    assert detect_altlocs(load_structure_with_altlocs(cif_path)).altloc_ids == ["A", "B"]
+    assert load_any(ensemble_path).stack_depth() == 2
+    selection = ";".join(find_altloc_selections(cif_path, min_span=1))
+
+    def classify(path: Path) -> list[dict]:
+        """Classify every altloc selection of the single-model structure on ``path``.
+
+        Parameters
+        ----------
+        path
+            Structure to classify the selections on.
+
+        Returns
+        -------
+        list[dict]
+            One ``_process_structure`` output row per classified selection.
+        """
+        row = pd.Series({"protein": "1VME", "structure": str(path), "selection": selection})
+        return classify_script._process_structure(
+            input_row=row,
+            cif_root=None,
+            domain_shift_min_span=50,
+            scoring_strategy=scorer,
+            loop_score_threshold=scorer.default_threshold,
+        )
+
+    single_model, ensemble = classify(cif_path), classify(ensemble_path)
+    assert single_model
+    for key in ("selection", "classification", "n_backbone_altloc_residues", "n_altlocs"):
+        assert [r[key] for r in ensemble] == [r[key] for r in single_model]
+    assert [r["score"] for r in ensemble] == pytest.approx(
+        [r["score"] for r in single_model], nan_ok=True
+    )
+    single_pairs = [json.loads(r["pair_scores"]) for r in single_model]
+    ensemble_pairs = [json.loads(r["pair_scores"]) for r in ensemble]
+    # Every loop row is scored by the one conformer pair; other rows have no pair scores
+    assert set().union(*single_pairs) == {"A-B"}
+    assert set().union(*ensemble_pairs) == {"model_0-model_1"}
