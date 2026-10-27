@@ -152,7 +152,7 @@ The `run_guidance()` function in `utils/guidance_script_utils.py` is the central
 
 ## Development Environment
 
-Dependencies are managed with [Pixi](https://pixi.sh). The model wrappers (Boltz, Protenix, RF3, Protpardelle) have mutually incompatible dependencies, so each model has its own `<model>` and `<model>-dev` environment; test in the matching `-dev` one. Other environments: `analysis[-dev]`, `boltz-analysis`, `boltz-osx`.
+Dependencies are managed with [Pixi](https://pixi.sh). The model wrappers (Boltz, Protenix, RF3, Protpardelle) have mutually incompatible dependencies, so each model has its own `<model>` and `<model>-dev` environment; test in the matching `-dev` one. Other environments: `analysis[-dev]`, `boltz-analysis`.
 
 | Command                           | Runs                                                |
 | --------------------------------- | --------------------------------------------------- |
@@ -165,7 +165,7 @@ Forward pytest options as one argument: `pixi run -e rf3-dev tests "-k integrati
 
 Mark tests that need a GPU or model checkpoint with `@pytest.mark.slow`, and tests that need CUDA with `@pytest.mark.gpu` (on CPU they crash or exhaust memory).
 
-Pre-commit hooks (ruff, ty, toml-sort, commitizen) run through [prek](https://github.com/j178/prek) and block commits on failure. `ty` is split per environment; see `.pre-commit-config.yaml` for the file routing.
+Pre-commit hooks (ruff, ty, toml-sort, commitizen) run through [prek](https://github.com/j178/prek) and block commits on failure. `ty` is split per environment; see `.pre-commit-config.yaml` for the file routing. On macOS the protenix `ty` hook is skipped (protenix has no macOS build); CI still checks it.
 
 ```bash
 pixi run -e boltz-dev prek install                          # git hook
