@@ -18,9 +18,9 @@ Kept as in Chroma:
 - The structure of each ``sde_func``: which terms are present, how
   ``inverse_temperature`` and ``langevin_factor`` enter the drift and the
   noise, and isothermal Langevin (``lambda_langevin = beta``).
-- Guidance is tempered together with the model score by default
-  (``temper_guidance=True``), because Chroma adds conditioner energies to the
-  diffusion energy before taking the gradient.
+- ``temper_guidance=True`` tempers guidance together with the model score,
+  because Chroma adds conditioner energies to the diffusion energy before
+  taking the gradient.
 - Heun's second drift evaluation uses the same ``t`` and the same noise draw.
 
 Rewritten for the VE parameterization the AF3-family wrappers were trained
@@ -119,6 +119,10 @@ class LangevinSamplerConfig:
     :meth:`with_edm_schedule` and :meth:`with_geometric_schedule` build a
     config on either discretization explicitly.
 
+    The Langevin defaults (``inverse_temperature=6``, ``langevin_factor=3``,
+    untempered guidance) are the best settings found in a density-guidance
+    sweep on Protenix, not Chroma's (10, 2, tempered).
+
     Parameters
     ----------
     sigma_data
@@ -158,8 +162,8 @@ class LangevinSamplerConfig:
         Rigidly align the noisy state onto the denoised prediction before the
         update (same operation as ``EDMSamplerConfig.alignment_reverse_diffusion``).
     temper_guidance
-        If True (default), ``inverse_temperature`` scales the step-scaler
-        guidance term along with the model score. If False, the guidance term
+        If True, ``inverse_temperature`` scales the step-scaler guidance term
+        along with the model score. If False (default), the guidance term
         uses the ``inverse_temperature=1`` coefficient, i.e. only the prior is
         tempered: ``p(x)^beta * p(y|x)``. ``langevin_factor`` still scales it
         in the ``reverse_sde`` and ``langevin`` modes.
@@ -190,11 +194,11 @@ class LangevinSamplerConfig:
     s_max: float = 160.0
     s_min: float = 4e-4
     p: float | None = 7.0
-    inverse_temperature: float = 1.0
-    langevin_factor: float = 0.0
+    inverse_temperature: float = 6.0
+    langevin_factor: float = 3.0
     sde_mode: Literal["reverse_sde", "langevin", "ode"] = "reverse_sde"
     align_xt_to_x0: bool = False
-    temper_guidance: bool = True
+    temper_guidance: bool = False
     integrate_func: Literal["euler_maruyama", "heun"] = "euler_maruyama"
     augmentation: bool = True
     align_to_input: bool = True
@@ -286,7 +290,7 @@ class AnnealedLangevinSampler:
     temperature-scaled score-following drift with an injected Langevin
     diffusion term instead of Heun's second-order ODE step.
 
-    With the default ``sde_mode="reverse_sde"``, ``inverse_temperature=1`` and
+    With ``sde_mode="reverse_sde"``, ``inverse_temperature=1`` and
     ``langevin_factor=0`` this is the plain reverse-time SDE; increasing
     ``langevin_factor`` adds equilibrating Langevin dynamics on top, as in
     Chroma's parameter of the same name.

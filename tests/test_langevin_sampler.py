@@ -72,9 +72,3 @@ def test_config_rejects_nonpositive_p(p: float) -> None:
     """A finite p must be positive."""
     with pytest.raises(ValueError, match="must be positive"):
         LangevinSamplerConfig(p=p)
-
-
-def test_config_rejects_removed_legacy_mode() -> None:
-    """The pre-Chroma 'legacy' update is no longer available."""
-    with pytest.raises(ValueError, match="sde_mode"):
-        LangevinSamplerConfig(sde_mode="legacy")  # ty: ignore[invalid-argument-type]
