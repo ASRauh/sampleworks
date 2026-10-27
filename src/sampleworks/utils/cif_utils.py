@@ -16,6 +16,7 @@ from loguru import logger
 
 from sampleworks.utils.atom_array_utils import (
     _closest_canonical_amino_acid,
+    BLANK_ALTLOC_IDS,
     find_all_altloc_ids,
     save_structure_to_cif,
     select_altloc,
@@ -61,6 +62,10 @@ def find_altloc_selections(
     Optionally, a final batch of selection strings is also yielded that contains all residues
     with altlocs, one selection per chain.
 
+    A multi-model ensemble that keeps altloc annotation is treated as one conformer per model.
+    This means that atoms with non-blank altloc ID in the first model conceptually corresponds
+    to altloc A atoms. Its spans are the contiguous runs of residues with non-blank altlocs.
+
     Parameters
     ----------
     cif_file : Path | str
@@ -95,14 +100,25 @@ def find_altloc_selections(
     structure.set_annotation("altloc_id", structure.get_annotation(altloc_label))
 
     altlocs = OrderedDict()
-    for altloc_id in find_all_altloc_ids(structure):
-        altk = select_altloc(structure, altloc_id=altloc_id)
-        unique_altk = set((ch, res) for ch, res in zip(altk.chain_id, altk.res_id, strict=True))
-        # probably unnecessary but making sure these are consistently ordered
-        # FIXME? This is a little clunky. Perhaps should be hierarchical by chain then altloc?
-        #   At some point though we'll do altloc selections using correlations/contacts
-        #   so this is probably not a big deal.
-        altlocs[altloc_id] = sorted(list(unique_altk))
+    if isinstance(structure, AtomArrayStack) and structure.stack_depth() > 1:
+        # Multi-model ensemble: one conformer per model with altloc annotation. Atoms share the
+        # altloc annotation across models (e.g. an atom cannot have blank altloc in model 1 but
+        # altloc "X" in model 2).
+        altk_mask = ~np.isin(structure.altloc_id, list(BLANK_ALTLOC_IDS))
+        residues = sorted(
+            set(zip(structure.chain_id[altk_mask], structure.res_id[altk_mask].tolist()))
+        )
+        for model_index in range(structure.stack_depth()):
+            altlocs[f"model_{model_index}"] = residues
+    else:
+        for altloc_id in find_all_altloc_ids(structure):
+            altk = select_altloc(structure, altloc_id=altloc_id)
+            unique_altk = set((ch, res) for ch, res in zip(altk.chain_id, altk.res_id, strict=True))
+            # probably unnecessary but making sure these are consistently ordered
+            # FIXME? This is a little clunky. Perhaps should be hierarchical by chain then altloc?
+            #   At some point though we'll do altloc selections using correlations/contacts
+            #   so this is probably not a big deal.
+            altlocs[altloc_id] = sorted(list(unique_altk))
 
     all_altloc_selections = {}
     for chain, start, end, _ in find_consecutive_residues(altlocs):

@@ -13,12 +13,13 @@ from biotite.structure.io.pdbx.cif import CIFColumn, CIFFile
 from sampleworks.utils.atom_array_utils import save_structure_to_cif
 from sampleworks.utils.cif_utils import (
     add_category_to_cif,
+    find_altloc_selections,
     find_consecutive_residues,
     renumber_atom_site_ids,
     resolve_mixed_hetatm_atom_altlocs,
 )
 
-from tests.utils.atom_array_builders import build_test_atom_array
+from tests.utils.atom_array_builders import altlocs_to_ensemble_cif, build_test_atom_array
 
 
 # ---------------------------------------------------------------------------
@@ -481,3 +482,23 @@ def test_find_consecutive_residues_keeps_a_chain_with_one_altloc_residue():
     altlocs = {"A": [("A", 5)], "B": [("A", 5)]}
 
     assert list(find_consecutive_residues(altlocs)) == [("A", 5, 5, {"A", "B"})]
+
+
+def test_find_altloc_selections_ensemble_matches_single_model(
+    tmp_path: Path, resources_dir: Path
+) -> None:
+    """A two-altloc structure rewritten as a 2-model ensemble yields the same selections.
+
+    Parameters
+    ----------
+    tmp_path
+        Directory for the ensemble CIF.
+    resources_dir
+        Test resources root.
+    """
+    cif_path = resources_dir / "1vme" / "1vme_final_carved_edited_0.5occA_0.5occB.cif"
+    ensemble_path = altlocs_to_ensemble_cif(cif_path, tmp_path / "ensemble.cif")
+
+    single_model = list(find_altloc_selections(cif_path))
+    assert single_model  # a span plus the catch-all
+    assert list(find_altloc_selections(ensemble_path)) == single_model
