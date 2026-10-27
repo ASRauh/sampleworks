@@ -1,12 +1,14 @@
-"""CPU check that the IT-opt latent seam resolves against the real RF3 conditioning.
+"""CPU check that the attribute names IT-opt uses for RF3's latents exist on RF3Conditioning.
 
-``AttrLatentIO`` reaches the trunk latents by attribute name, and the guidance wiring looks
-those names up in ``DEFAULT_SINGLE_REP_ATTR`` / ``DEFAULT_PAIR_REP_ATTR``. Nothing otherwise
-ties either map to ``RF3Conditioning``, so renaming a field there would leave the maps stale
-and surface only as a runtime error part-way into a GPU run. The sibling tests in
-``test_latent_adapter.py`` cover the same seam against mock dataclasses; this one pins it to
-the conditioning RF3 actually produces. No checkpoint and no GPU -- it skips unless RF3 is
-installed. See docs/IT_OPT_DESIGN.md.
+IT-opt reaches a model's latents through the names in DEFAULT_SINGLE_REP_ATTR and
+DEFAULT_PAIR_REP_ATTR (models/latent_adapter.py); for RF3 they are "s_trunk" and "z_trunk".
+These are plain strings, and nothing in the code ties them to the fields of RF3Conditioning. If
+a field were renamed, the table would still look fine and the mismatch would only show up on a
+GPU, part-way into a latent optimization run. So this test builds a small RF3Conditioning from
+random tensors and checks that AttrLatentIO can read and write it under those names, which turns
+a rename into a fast-test failure instead. test_latent_adapter.py covers AttrLatentIO itself
+against mock dataclasses; this is the only CPU test that uses the real class. Needs RF3
+installed, but no checkpoint and no GPU; skips otherwise.
 """
 
 import torch

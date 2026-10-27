@@ -844,6 +844,11 @@ class Boltz2Wrapper:
             )
         )
 
+        # IT-opt replaces s and z on the conditioning. Each time they are updated, whether in the
+        # inner loop or the outer loop, the bundle must be rebuilt, so we keep this reference to
+        # what it was last built from. step() compares the conditioning's s and z against this
+        # pair by identity and rebuilds the bundle when they differ. Every rebuild comes back
+        # through here, so the reference always points at the latents behind the current bundle.
         self._dc_src = (s_trunk, z_trunk)
 
         return {
