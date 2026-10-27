@@ -10,7 +10,7 @@ import reciprocalspaceship as rs
 import torch
 from sampleworks.synthetic.generate_synthetic_sf_sfc import (
     _process_single_row,
-    load_models,
+    load_models_with_populations,
     process_batch,
 )
 from sampleworks.synthetic.synthetic_utils import BatchRowForMTZ
@@ -299,7 +299,7 @@ class TestEnsembleSum:
 
 
 class TestPopulations:
-    """How ``load_models`` turns occupancy options into per-model populations."""
+    """How ``load_models_with_populations`` turns occupancy args into model populations."""
 
     def test_multi_model_populations_use_shared_occupancy_policy(
         self, multi_model_path: Path
@@ -315,8 +315,10 @@ class TestPopulations:
         multi_model_path
             Two-model toy ensemble.
         """
-        _, trimmed = load_models(multi_model_path, "custom", [0.4, 0.6, 0.0])
-        _, padded = load_models(multi_model_path, "custom", [1.0])
+        _, trimmed = load_models_with_populations(
+            multi_model_path, "custom", [0.4, 0.6, 0.0]
+        )
+        _, padded = load_models_with_populations(multi_model_path, "custom", [1.0])
 
         assert trimmed == [0.4, 0.6]
         assert padded == [1.0, 0.0]
@@ -370,7 +372,7 @@ class TestPopulations:
         multi_model_path
             Two-model toy ensemble.
         """
-        _, populations = load_models(multi_model_path, "uniform", [])
+        _, populations = load_models_with_populations(multi_model_path, "uniform", [])
 
         assert populations == [0.5, 0.5]
 
@@ -388,7 +390,7 @@ class TestPopulations:
             Occupancy mode that cannot supply per-model occupancies by itself.
         """
         with pytest.raises(ValueError, match="one population per model"):
-            load_models(multi_model_path, occupancy_mode, [])
+            load_models_with_populations(multi_model_path, occupancy_mode, [])
 
     def test_single_model_keeps_altloc_occupancies(self, tmp_path: Path) -> None:
         """Verify a single model is one conformer whose occupancy options apply to its altlocs.
@@ -402,7 +404,9 @@ class TestPopulations:
             tmp_path / "multi_altlocs.pdb", [_toy_single_model(OFFSETS, OCCUPANCIES, ALTLOC_IDS)]
         )
 
-        models, populations = load_models(tmp_path / "multi_altlocs.pdb", "custom", [0.3, 0.7])
+        models, populations = load_models_with_populations(
+            tmp_path / "multi_altlocs.pdb", "custom", [0.3, 0.7]
+        )
 
         assert populations == [1.0]
         (atom_array,) = models
@@ -425,7 +429,9 @@ class TestPopulations:
         )
 
         with pytest.raises(ValueError, match="at most one non-blank altloc ID"):
-            load_models(tmp_path / "multi_model.pdb", "custom", OCCUPANCIES)
+            load_models_with_populations(
+                tmp_path / "multi_model.pdb", "custom", OCCUPANCIES
+            )
 
 
 class TestRowsAndBatch:

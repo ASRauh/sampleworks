@@ -58,7 +58,7 @@ from sampleworks.synthetic.synthetic_utils import (
     load_structure_for_synthetic_loss,
     resolve_crystal_metadata,
     resolve_mtz_column,
-    resolve_occupancy_values,
+    normalize_occupancy_values_for_states,
     resolve_parallel_jobs,
 )
 from sampleworks.utils.atom_array_utils import detect_altlocs
@@ -240,7 +240,7 @@ def process_amplitudes_to_dataset(
     return dataset
 
 
-def load_models(
+def load_models_with_populations(
     structure_path: Path,
     occupancy_mode: str,
     occupancy_values: list[float],
@@ -316,7 +316,9 @@ def load_models(
                 f"occupancy_values required for custom mode: pass one population per model "
                 f"of the {n_models}-model file."
             )
-        populations = resolve_occupancy_values(occupancy_values, n_models, "models")
+        populations = normalize_occupancy_values_for_states(
+            occupancy_values, n_models, "models"
+        )
     elif occupancy_mode == "default":
         raise ValueError(
             f"Occupancy mode 'default' is not supported for a {n_models}-model file; pass one "
@@ -328,7 +330,13 @@ def load_models(
     models = []
     for model in range(n_models):
         # Keep the file's per-atom occupancies; each model is set to 1.0 below.
-        atom_array = load_filtered(structure_path, "default", [], model=model)
+        atom_array = load_filtered(
+            structure_path,
+            "default",
+            [],
+            model=model,
+            drop_zero_occupancy=False,
+        )
         if atom_array is None:
             raise ValueError(f"Failed to load model {model + 1} of {structure_path}")
         altloc_ids = detect_altlocs(atom_array).altloc_ids
@@ -359,7 +367,7 @@ def compute_ensemble_structure_factors(
     Parameters
     ----------
     models
-        One atom array per model, as returned by ``load_models``.
+        One atom array per model, as returned by ``load_models_with_populations``.
     populations
         Population weighting each model, in the same order.
     cell
@@ -528,7 +536,7 @@ def _process_single_row(
     try:
         cell, space_group = resolve_crystal_metadata(row, structure_path)
         logger.info(f"Cell {cell.parameters}, space group '{space_group}'")
-        models, populations = load_models(
+        models, populations = load_models_with_populations(
             structure_path,
             occupancy_mode,
             row.occupancy_values,
