@@ -315,9 +315,7 @@ class TestPopulations:
         multi_model_path
             Two-model toy ensemble.
         """
-        _, trimmed = load_models_with_populations(
-            multi_model_path, "custom", [0.4, 0.6, 0.0]
-        )
+        _, trimmed = load_models_with_populations(multi_model_path, "custom", [0.4, 0.6, 0.0])
         _, padded = load_models_with_populations(multi_model_path, "custom", [1.0])
 
         assert trimmed == [0.4, 0.6]
@@ -429,9 +427,7 @@ class TestPopulations:
         )
 
         with pytest.raises(ValueError, match="at most one non-blank altloc ID"):
-            load_models_with_populations(
-                tmp_path / "multi_model.pdb", "custom", OCCUPANCIES
-            )
+            load_models_with_populations(tmp_path / "multi_model.pdb", "custom", OCCUPANCIES)
 
 
 class TestRowsAndBatch:

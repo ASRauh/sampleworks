@@ -56,9 +56,9 @@ from sampleworks.synthetic.synthetic_utils import (
     BatchRowForMTZ,
     load_batch_csv,
     load_structure_for_synthetic_loss,
+    normalize_occupancy_values_for_states,
     resolve_crystal_metadata,
     resolve_mtz_column,
-    normalize_occupancy_values_for_states,
     resolve_parallel_jobs,
 )
 from sampleworks.utils.atom_array_utils import detect_altlocs
@@ -316,9 +316,7 @@ def load_models_with_populations(
                 f"occupancy_values required for custom mode: pass one population per model "
                 f"of the {n_models}-model file."
             )
-        populations = normalize_occupancy_values_for_states(
-            occupancy_values, n_models, "models"
-        )
+        populations = normalize_occupancy_values_for_states(occupancy_values, n_models, "models")
     elif occupancy_mode == "default":
         raise ValueError(
             f"Occupancy mode 'default' is not supported for a {n_models}-model file; pass one "
