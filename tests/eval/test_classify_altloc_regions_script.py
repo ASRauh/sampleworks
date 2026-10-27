@@ -128,7 +128,7 @@ def test_ensemble_classification_matches_single_model(
         )
 
     single_model, ensemble = classify(cif_path), classify(ensemble_path)
-    assert single_model
+    assert single_model, "no selections were classified; the comparisons below would be vacuous"
     for key in ("selection", "classification", "n_backbone_altloc_residues", "n_altlocs"):
         assert [r[key] for r in ensemble] == [r[key] for r in single_model]
     assert [r["score"] for r in ensemble] == pytest.approx(
