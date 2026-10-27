@@ -159,6 +159,47 @@ def validate_occupancy_values(occupancy_values: list[float]) -> None:
         raise ValueError(f"Occupancy values must sum to 1.0, got {sum(occupancy_values)}")
 
 
+def normalize_occupancy_values_for_states(
+    occupancy_values: list[float], n_states: int, state_label: str
+) -> list[float]:
+    """Normalize custom occupancy values to the number of states, then validate them.
+
+    Parameters
+    ----------
+    occupancy_values
+        User-specified occupancy values, one per state in order.
+    n_states
+        Number of states (e.g. altlocs or models) the values weight.
+    state_label
+        Plural name of the states, used in warnings (e.g. ``"altlocs"``).
+
+    Returns
+    -------
+    list[float]
+        ``n_states`` values: extra values are dropped and missing ones set to 0, each with
+        a warning.
+
+    Raises
+    ------
+    ValueError
+        If the normalized values are outside [0.0, 1.0] or do not sum to 1.0.
+    """
+    if len(occupancy_values) > n_states:
+        logger.warning(
+            f"Got {len(occupancy_values)} occupancy values but structure "
+            f"has {n_states} {state_label}. Extra values will be ignored."
+        )
+        occupancy_values = occupancy_values[:n_states]
+    elif len(occupancy_values) < n_states:
+        logger.warning(
+            f"Got {len(occupancy_values)} occupancy values but structure "
+            f"has {n_states} {state_label}. Missing values are automatically set to 0."
+        )
+        occupancy_values = occupancy_values + [0.0] * (n_states - len(occupancy_values))
+    validate_occupancy_values(occupancy_values)
+    return occupancy_values
+
+
 def assign_occupancies(
     atom_array: AtomArray,
     altloc_info: AltlocInfo,
@@ -215,20 +256,9 @@ def assign_occupancies(
     elif occupancy_mode == "custom":
         if occupancy_values is None:
             raise ValueError("occupancy_values required for custom mode")
-        n_altlocs = len(altloc_info.altloc_ids)
-        if len(occupancy_values) > n_altlocs:
-            logger.warning(
-                f"Got {len(occupancy_values)} occupancy values but structure "
-                f"has {n_altlocs} altlocs. Extra values will be ignored."
-            )
-            occupancy_values = occupancy_values[:n_altlocs]
-        elif len(occupancy_values) < n_altlocs:
-            logger.warning(
-                f"Got {len(occupancy_values)} occupancy values but structure "
-                f"has {n_altlocs} altlocs. Missing values are automatically set to 0."
-            )
-            occupancy_values = occupancy_values + [0.0] * (n_altlocs - len(occupancy_values))
-        validate_occupancy_values(occupancy_values)
+        occupancy_values = normalize_occupancy_values_for_states(
+            occupancy_values, len(altloc_info.altloc_ids), "altlocs"
+        )
         for altloc, occupancy_value in zip(sorted(altloc_info.altloc_ids), occupancy_values):
             occupancy[altloc_info.atom_masks[altloc]] = occupancy_value
 
@@ -245,6 +275,7 @@ def load_structure_for_synthetic_loss(
     selection: str | None = None,
     b_factor: float | None = None,
     model: int = 0,
+    drop_zero_occupancy: bool = True,
 ) -> AtomArray | None:
     """Load and prepare a structure for synthetic loss generation.
 
@@ -276,8 +307,10 @@ def load_structure_for_synthetic_loss(
         preserve the values from the input structure.
     model
         0-based index of the one model to load from a multi-model file. Callers that
-        need every model (e.g. ``generate_synthetic_sf_ensemble``) call this once per
+        need every model (e.g. ``generate_synthetic_sf_sfc``) call this once per
         model.
+    drop_zero_occupancy
+        If True, remove atoms whose occupancy is zero after occupancy assignment.
 
     Returns
     -------
@@ -336,10 +369,11 @@ def load_structure_for_synthetic_loss(
         logger.error(f"Invalid occupancy mode '{occupancy_mode}' for {structure_path}")
         raise ValueError(f"Invalid occupancy mode '{occupancy_mode}'")
 
-    zero_occupancy = atom_array.occupancy == 0.0
-    if zero_occupancy.any():
-        logger.info(f"Removed {zero_occupancy.sum()} zero-occupancy atoms")
-        atom_array = atom_array[~zero_occupancy]
+    if drop_zero_occupancy:
+        zero_occupancy = atom_array.occupancy == 0.0
+        if zero_occupancy.any():
+            logger.info(f"Removed {zero_occupancy.sum()} zero-occupancy atoms")
+            atom_array = atom_array[~zero_occupancy]
 
     if b_factor is not None:
         atom_array.b_factor = np.full(len(atom_array), b_factor, dtype=np.float32)

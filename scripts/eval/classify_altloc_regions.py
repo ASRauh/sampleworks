@@ -447,7 +447,10 @@ def _process_structure(
         # classified
         covered_res_ids = selection_to_residues(atom_array, selection_str)
         if covered_res_ids and covered_res_ids == all_altloc_res_ids:
-            continue
+            # A single span can cover every altloc residue too (7DMS residue 5). Only the
+            # union carries "((", from cif_utils.py line 122, so skip on that mark alone.
+            if "((" in selection_str:
+                continue
         try:
             out = _classify_selection(
                 atom_array=atom_array,
