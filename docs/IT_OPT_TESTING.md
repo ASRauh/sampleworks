@@ -82,15 +82,6 @@ print("z_copy.grad abs-sum:", None if z_copy.grad is None else z_copy.grad.abs()
 **Expect** `grad is None → False`, `abs-sum → > 0`. Repeat with `read_single`/`write_single` and
 `s_trunk` to check `s`.
 
-<!-- TODO: the paragraph below is wrong. Measured 2026-10-22 with
-tests/models/test_latent_gradient.py on Protenix: with the cache ON, `z_copy.grad` is None, not
-non-zero. The diffusion module is handed the cached `pair_z`/`p_lm`/`c_l` and never reads
-`z_trunk`, so Level 0 fails for `z` until the cache is off (§1(b)). IT_OPT_DESIGN.md §5
-("a stale cache silently zeroes the z gradient") has it right; rewrite this to match. -->
-> With the `z` cache **on**, this still shows a non-zero grad (through the direct `z_trunk` arg) but
-> the forward used the stale `pair_z`. Level 0 confirms the copy reaches the trunk, not cache
-> correctness — that is why §1(b) matters for real `z` runs.
-
 ### Level 1 — A tiny end-to-end run
 
 ```python
