@@ -72,18 +72,21 @@ class LossSpec:
     description
         One-line summary, shown in ``--help``.
     required_options
-        Options this loss cannot be built without, or a function of the loss's
-        options returning them when that depends on other options. The builder
-        raises on them too -- that is the guarantee for library callers -- but
-        declaring them here lets the CLI and grid search report a missing one
-        before a model is loaded.
+        Options this loss cannot be built without. The builder raises on them
+        too -- that is the guarantee for library callers -- but declaring them
+        here lets the CLI and grid search report a missing one before a model
+        is loaded.
+    conditional_required_options
+        For options required only for some values of other options: a function
+        from the loss's options to the extra options it needs.
     """
 
     name: Losses
     options_cls: type
     builder_path: str
     description: str
-    required_options: tuple[str, ...] | Callable[[Any], tuple[str, ...]] = ()
+    required_options: tuple[str, ...] = ()
+    conditional_required_options: Callable[[Any], tuple[str, ...]] | None = None
 
     def required_for(self, options: Any) -> tuple[str, ...]:
         """Return the options this loss needs, given its other option values.
@@ -98,9 +101,9 @@ class LossSpec:
         tuple[str, ...]
             Names of the options that must not be ``None``.
         """
-        if callable(self.required_options):
-            return self.required_options(options)
-        return self.required_options
+        if self.conditional_required_options is None:
+            return self.required_options
+        return self.required_options + self.conditional_required_options(options)
 
     def builder(self) -> Callable[[Any, LossBuildContext], LossFunctionProtocol]:
         """Import and return this loss's builder function.
@@ -145,7 +148,7 @@ LOSS_SPECS: dict[Losses, LossSpec] = {
         options_cls=DiffuseBraggOptions,
         builder_path="sampleworks.core.losses.diffuse_bragg:build_diffuse_bragg_loss",
         description="Bragg amplitudes plus anisotropic diffuse intensities, via lunus.sf.",
-        required_options=_diffuse_bragg_required,
+        conditional_required_options=_diffuse_bragg_required,
     ),
 }
 
