@@ -400,23 +400,32 @@ jobs:
                         ephemeral-storage: 512Mi
           MANIFEST
           # Poll both terminal conditions: `kubectl wait` for Complete alone
-          # would sit through the whole deadline on a Failed job.
-          deadline=$((SECONDS + 3600))
+          # would sit through the whole deadline on a Failed job. A pull
+          # error never fails the container, so the Job would only turn
+          # Failed at its deadline, with the pod (and the error) already
+          # gone: stop on the pod's pull error instead, and keep the last
+          # pod dump for the report. A single failed poll is retried.
+          pods='{range .items[*]}{.metadata.name}{" on "}{.spec.nodeName}{" "}{.status.phase}{" "}{.status.containerStatuses[*].state.waiting.reason}{" "}{.status.containerStatuses[*].state.waiting.message}{"\n"}{end}'
+          deadline=$((SECONDS + 3700))
           state=""
+          last=""
           while [ "${SECONDS}" -lt "${deadline}" ]; do
-            state=$(kubectl get "job/${job}" -o jsonpath='{.status.conditions[?(@.status=="True")].type}')
+            state=$(kubectl get "job/${job}" -o jsonpath='{.status.conditions[?(@.status=="True")].type}' 2>/dev/null) || state=""
             case "${state}" in *Complete*|*Failed*) break ;; esac
+            last=$(kubectl get pods -l "job-name=${job}" -o jsonpath="${pods}" 2>/dev/null) || true
+            case "${last}" in *ErrImagePull*|*ImagePullBackOff*|*InvalidImageName*) state="ImagePullError"; break ;; esac
             sleep 15
           done
-          pods='{range .items[*]}{.metadata.name}{" on "}{.spec.nodeName}{" "}{.status.phase}{" "}{.status.containerStatuses[*].state.waiting.reason}{" "}{.status.containerStatuses[*].state.waiting.message}{"\n"}{end}'
           case "${state}" in
             *Complete*)
-              kubectl get pods -l "job-name=${job}" -o jsonpath='{"image warmed on GPU node "}{.items[0].spec.nodeName}{"\n"}'
+              node=$(kubectl get pods -l "job-name=${job}" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null) || node="unknown"
+              echo "image warmed on GPU node ${node}"
               ;;
             *)
               echo "warm job ended with condition '${state:-none}' before completing" >&2
-              kubectl get "job/${job}" -o jsonpath='{range .status.conditions[*]}{.type}{": "}{.message}{"\n"}{end}' >&2
-              kubectl get pods -l "job-name=${job}" -o jsonpath="${pods}" >&2
+              kubectl get "job/${job}" -o jsonpath='{range .status.conditions[*]}{.type}{": "}{.message}{"\n"}{end}' >&2 || true
+              printf '%s\n' "${last}" >&2
+              kubectl delete "job/${job}" --ignore-not-found >&2 || true
               exit 1
               ;;
           esac
