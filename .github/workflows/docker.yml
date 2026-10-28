@@ -393,15 +393,30 @@ jobs:
                       requests:
                         cpu: 100m
                         memory: 64Mi
+                        ephemeral-storage: 256Mi
                       limits:
                         cpu: 500m
                         memory: 256Mi
+                        ephemeral-storage: 512Mi
           MANIFEST
-          if ! kubectl wait --for=condition=complete --timeout=60m "job/${job}"; then
-            echo "warm job did not complete; pod state:" >&2
-            kubectl get pods -l "job-name=${job}" \
-              -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.status.containerStatuses[*].state.waiting.reason}{" "}{.status.containerStatuses[*].state.waiting.message}{"\n"}{end}' >&2
-            exit 1
-          fi
-          node=$(kubectl get pods -l "job-name=${job}" -o jsonpath='{.items[0].spec.nodeName}')
-          echo "image warmed on GPU node ${node}"
+          # Poll both terminal conditions: `kubectl wait` for Complete alone
+          # would sit through the whole deadline on a Failed job.
+          deadline=$((SECONDS + 3600))
+          state=""
+          while [ "${SECONDS}" -lt "${deadline}" ]; do
+            state=$(kubectl get "job/${job}" -o jsonpath='{.status.conditions[?(@.status=="True")].type}')
+            case "${state}" in *Complete*|*Failed*) break ;; esac
+            sleep 15
+          done
+          pods='{range .items[*]}{.metadata.name}{" on "}{.spec.nodeName}{" "}{.status.phase}{" "}{.status.containerStatuses[*].state.waiting.reason}{" "}{.status.containerStatuses[*].state.waiting.message}{"\n"}{end}'
+          case "${state}" in
+            *Complete*)
+              kubectl get pods -l "job-name=${job}" -o jsonpath='{"image warmed on GPU node "}{.items[0].spec.nodeName}{"\n"}'
+              ;;
+            *)
+              echo "warm job ended with condition '${state:-none}' before completing" >&2
+              kubectl get "job/${job}" -o jsonpath='{range .status.conditions[*]}{.type}{": "}{.message}{"\n"}{end}' >&2
+              kubectl get pods -l "job-name=${job}" -o jsonpath="${pods}" >&2
+              exit 1
+              ;;
+          esac
