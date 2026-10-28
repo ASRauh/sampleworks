@@ -208,6 +208,8 @@ jobs:
     needs: public
     permissions:
       contents: read
+    outputs:
+      image-digest: ${{ steps.astera-build.outputs.digest }}
     env:
       ASTERA_REGISTRY: ${{ secrets.ASTERA_REGISTRY }}
 
@@ -292,3 +294,114 @@ jobs:
 
       - name: Astera image digest
         run: echo "Astera image pushed with digest ${{ steps.astera-build.outputs.digest }}"
+
+  warm_gpu_cache:
+    # Seeds the GPU fleet's image cache with the image just pushed. GPU nodes
+    # share pulled layers peer-to-peer (Spegel, astera-k3s src/spegel.ts), so
+    # one pull on one GPU node makes the first user pull run at peer speed
+    # instead of pulling ~48 GB from Harbor over the tailnet.
+    #
+    # The kubeconfig secret is the `image-warm-ci` ServiceAccount from
+    # astera-k3s (src/image-warm.ts): it can create Jobs in the `image-warm`
+    # namespace and nothing else, and it only resolves from inside the cluster,
+    # which is why this runs on the self-hosted builder.
+    name: Warm GPU image cache
+    runs-on: diffuse-sh-builder
+    needs: astera
+    permissions:
+      contents: read
+    env:
+      ASTERA_REGISTRY: ${{ secrets.ASTERA_REGISTRY }}
+
+    steps:
+      - name: Install kubectl
+        uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.36.0
+
+      - name: Write image-warm kubeconfig
+        env:
+          KUBECONFIG_CONTENTS: ${{ secrets.ASTERA_IMAGE_WARM_KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KUBECONFIG_CONTENTS:-}" ]; then
+            echo "secrets.ASTERA_IMAGE_WARM_KUBECONFIG is empty; set it in repo settings" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s' "${KUBECONFIG_CONTENTS}" > "${RUNNER_TEMP}/image-warm.yaml"
+          echo "KUBECONFIG=${RUNNER_TEMP}/image-warm.yaml" >> "${GITHUB_ENV}"
+
+      - name: Pull the image on a GPU node
+        env:
+          IMAGE_DIGEST: ${{ needs.astera.outputs.image-digest }}
+        # The pod runs the pushed digest with command `true`: the pull is the
+        # work. No GPU is requested, so no GPU is held while 48 GB download.
+        # The namespace enforces Pod Security `restricted`, hence the full
+        # securityContext. Pod placement mirrors the gpu-1 runners: the
+        # diffuse-bound GPU nodes, which already run this image.
+        run: |
+          set -euo pipefail
+          if [ -z "${IMAGE_DIGEST}" ] || [ "${IMAGE_DIGEST}" = "${IMAGE_DIGEST#sha256:}" ]; then
+            echo "astera job did not produce a sha256 digest: ${IMAGE_DIGEST}" >&2
+            exit 1
+          fi
+          job="warm-${GITHUB_SHA::7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          kubectl create -f - <<MANIFEST
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${job}
+            labels:
+              app.kubernetes.io/name: image-warm
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 3600
+            ttlSecondsAfterFinished: 600
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: image-warm
+              spec:
+                restartPolicy: Never
+                nodeSelector:
+                  gpu: "on"
+                  astera.org/ns-diffuse: "true"
+                tolerations:
+                  - key: nvidia.com/gpu
+                    operator: Exists
+                    effect: NoSchedule
+                  - key: astera.org/namespace
+                    operator: Exists
+                    effect: NoSchedule
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 65534
+                  runAsGroup: 65534
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: warm
+                    image: ${ASTERA_REGISTRY}/${ASTERA_IMAGE_NAME}@${IMAGE_DIGEST}
+                    imagePullPolicy: Always
+                    command: ["/bin/true"]
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                        drop: ["ALL"]
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 64Mi
+                      limits:
+                        cpu: 500m
+                        memory: 256Mi
+          MANIFEST
+          if ! kubectl wait --for=condition=complete --timeout=60m "job/${job}"; then
+            echo "warm job did not complete; pod state:" >&2
+            kubectl get pods -l "job-name=${job}" \
+              -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.status.containerStatuses[*].state.waiting.reason}{" "}{.status.containerStatuses[*].state.waiting.message}{"\n"}{end}' >&2
+            exit 1
+          fi
+          node=$(kubectl get pods -l "job-name=${job}" -o jsonpath='{.items[0].spec.nodeName}')
+          echo "image warmed on GPU node ${node}"
