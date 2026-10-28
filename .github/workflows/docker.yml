@@ -364,6 +364,7 @@ jobs:
                   app.kubernetes.io/name: image-warm
               spec:
                 restartPolicy: Never
+                activeDeadlineSeconds: 3600
                 nodeSelector:
                   gpu: "on"
                   astera.org/ns-diffuse: "true"
