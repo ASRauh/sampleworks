@@ -35,7 +35,8 @@ if TYPE_CHECKING:
     from sampleworks.core.losses.protocol import LossFunctionProtocol
 
 
-_BOOLEAN_TEXT = {"true": True, "yes": True, "1": True, "false": False, "no": False, "0": False}
+_TRUE_TEXT = frozenset({"true", "t", "yes", "y", "on", "1"})
+_FALSE_TEXT = frozenset({"false", "f", "no", "n", "off", "0"})
 
 
 @dataclass(frozen=True)
@@ -71,17 +72,35 @@ class LossSpec:
     description
         One-line summary, shown in ``--help``.
     required_options
-        Options this loss cannot be built without. The builder raises on them
-        too -- that is the guarantee for library callers -- but declaring them
-        here lets the CLI report a missing one as a usage error, before a model
-        is loaded.
+        Options this loss cannot be built without, or a function of the loss's
+        options returning them when that depends on other options. The builder
+        raises on them too -- that is the guarantee for library callers -- but
+        declaring them here lets the CLI and grid search report a missing one
+        before a model is loaded.
     """
 
     name: Losses
     options_cls: type
     builder_path: str
     description: str
-    required_options: tuple[str, ...] = ()
+    required_options: tuple[str, ...] | Callable[[Any], tuple[str, ...]] = ()
+
+    def required_for(self, options: Any) -> tuple[str, ...]:
+        """Return the options this loss needs, given its other option values.
+
+        Parameters
+        ----------
+        options
+            An instance of ``options_cls``.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Names of the options that must not be ``None``.
+        """
+        if callable(self.required_options):
+            return self.required_options(options)
+        return self.required_options
 
     def builder(self) -> Callable[[Any, LossBuildContext], LossFunctionProtocol]:
         """Import and return this loss's builder function.
@@ -93,6 +112,16 @@ class LossSpec:
         """
         module_path, function_name = self.builder_path.split(":")
         return getattr(importlib.import_module(module_path), function_name)
+
+
+def _diffuse_bragg_required(options: DiffuseBraggOptions) -> tuple[str, ...]:
+    """A target is needed only for a term with nonzero weight."""
+    required = []
+    if options.bragg_weight > 0.0:
+        required.append("bragg_target")
+    if options.bragg_weight < 1.0:
+        required.append("diffuse_target")
+    return tuple(required)
 
 
 LOSS_SPECS: dict[Losses, LossSpec] = {
@@ -116,7 +145,7 @@ LOSS_SPECS: dict[Losses, LossSpec] = {
         options_cls=DiffuseBraggOptions,
         builder_path="sampleworks.core.losses.diffuse_bragg:build_diffuse_bragg_loss",
         description="Bragg amplitudes plus anisotropic diffuse intensities, via lunus.sf.",
-        # Which target is required depends on bragg_weight; the builder checks.
+        required_options=_diffuse_bragg_required,
     ),
 }
 
@@ -189,32 +218,36 @@ def coerce_options(spec: LossSpec, raw: Mapping[str, Any]) -> Any:
     return spec.options_cls(**dict(raw))
 
 
+# Option name -> (option class, field), across every loss. A proteins-CSV column is
+# not tied to one loss, so it is parsed by name; losses sharing a name share its
+# type (tests/losses/test_loss_registry.py holds them to that), so any one
+# declaration serves. Each loss still validates the parsed value when its
+# options are built.
+_OPTION_DECLARATIONS: dict[str, tuple[type, dataclasses.Field]] = {
+    option.name: (spec.options_cls, option)
+    for spec in LOSS_SPECS.values()
+    for option in dataclasses.fields(spec.options_cls)
+}
+
+
 def loss_option_names() -> list[str]:
     """Return every option name declared by any registered loss.
 
     Returns
     -------
     list[str]
-        Sorted, de-duplicated option names.
+        Sorted option names.
     """
-    return sorted(
-        {f.name for spec in LOSS_SPECS.values() for f in dataclasses.fields(spec.options_cls)}
-    )
+    return sorted(_OPTION_DECLARATIONS)
 
 
-def _first_declaration(name: str) -> tuple[type, dataclasses.Field]:
-    """Return the first registered option class declaring ``name``, and its field.
-
-    Losses that share an option name share its meaning and type (a registry test
-    holds them to that), so any declaration describes them all.
-    """
-    for spec in LOSS_SPECS.values():
-        for option in dataclasses.fields(spec.options_cls):
-            if option.name == name:
-                return spec.options_cls, option
-    raise ValueError(
-        f"No registered loss has an option named {name!r}. Loss options: {loss_option_names()}."
-    )
+def _declaration(name: str) -> tuple[type, dataclasses.Field]:
+    try:
+        return _OPTION_DECLARATIONS[name]
+    except KeyError:
+        raise ValueError(
+            f"No registered loss has an option named {name!r}. Loss options: {loss_option_names()}."
+        ) from None
 
 
 def is_path_option(name: str) -> bool:
@@ -235,8 +268,35 @@ def is_path_option(name: str) -> bool:
     ValueError
         If no registered loss declares ``name``.
     """
-    _, option = _first_declaration(name)
+    _, option = _declaration(name)
     return bool(option.metadata["path"])
+
+
+def bool_from_text(text: str) -> bool:
+    """Parse a boolean written as text, case-insensitively.
+
+    Parameters
+    ----------
+    text
+        One of ``true``/``t``/``yes``/``y``/``on``/``1`` or
+        ``false``/``f``/``no``/``n``/``off``/``0``, in any case.
+
+    Returns
+    -------
+    bool
+        The value ``text`` spells.
+
+    Raises
+    ------
+    ValueError
+        If ``text`` is none of those.
+    """
+    lowered = text.strip().lower()
+    if lowered in _TRUE_TEXT:
+        return True
+    if lowered in _FALSE_TEXT:
+        return False
+    raise ValueError(f"Expected true or false, got {text!r}.")
 
 
 def option_from_text(name: str, text: str) -> Any:
@@ -247,8 +307,8 @@ def option_from_text(name: str, text: str) -> Any:
     name
         Option name, as declared by any registered loss.
     text
-        The value as written: ``true``/``false`` for booleans, whitespace-separated
-        items for lists, JSON for dict-valued options.
+        The value as written: see :func:`bool_from_text` for booleans,
+        whitespace-separated items for lists, JSON for dict-valued options.
 
     Returns
     -------
@@ -261,15 +321,14 @@ def option_from_text(name: str, text: str) -> Any:
         If no registered loss declares ``name``, or ``text`` is not a valid
         value for it.
     """
-    options_cls, option = _first_declaration(name)
+    options_cls, option = _declaration(name)
     value_type = option_type(options_cls, name)
     if option.metadata["json_arg"]:
         return json.loads(text)
     if value_type is bool:
-        lowered = text.lower()
-        if lowered not in _BOOLEAN_TEXT:
-            raise ValueError(f"Expected true or false for option {name!r}, got {text!r}.")
-        return _BOOLEAN_TEXT[lowered]
+        return bool_from_text(text)
+    # value_type is a type hint such as list[str], not a list, so isinstance does not
+    # apply; add_loss_args unpacks list options the same way.
     if typing.get_origin(value_type) is list:
         item_type = typing.get_args(value_type)[0]
         return [item_type(item) for item in text.split()]

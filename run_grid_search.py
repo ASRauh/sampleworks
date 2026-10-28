@@ -585,10 +585,14 @@ def protein_loss_config(losses: LossConfig, protein: ProteinInput) -> LossConfig
     Raises
     ------
     ValueError
-        If a loss still lacks a required option, so the grid fails before any
-        job is queued rather than one worker at a time.
+        If a CSV value is invalid for a loss (e.g. a non-positive resolution) or a
+        loss still lacks a required option, so the grid fails before any job is
+        queued rather than one worker at a time.
     """
-    config = losses.with_defaults(protein.loss_options).with_effective_options()
+    try:
+        config = losses.with_unset_options_from(protein.loss_options).with_effective_options()
+    except ValueError as error:
+        raise ValueError(f"Protein '{protein.name}': {error}") from error
     missing = config.missing_required_options()
     if missing:
         raise ValueError(
@@ -602,7 +606,7 @@ def protein_loss_config(losses: LossConfig, protein: ProteinInput) -> LossConfig
     return config
 
 
-def trial_dir_suffix(losses: LossConfig) -> str:
+def get_trial_dir_suffix_from_loss(losses: LossConfig) -> str:
     """Return the trial-directory suffix that keeps runs of different losses apart.
 
     Density-only runs get none, so grids written before losses were selectable
@@ -640,7 +644,7 @@ def generate_jobs(args: argparse.Namespace) -> list[JobConfig]:
         structure = protein.structure
         protein_name = protein.name
         losses = protein_loss_config(args.losses, protein)
-        loss_suffix = trial_dir_suffix(losses)
+        loss_suffix = get_trial_dir_suffix_from_loss(losses)
 
         method_suffix = f"_{args.method.replace(' ', '_')}" if args.method else ""
         for scaler in scalers:

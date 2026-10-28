@@ -206,6 +206,46 @@ class TestLossSelection:
         with pytest.raises(ValueError, match="Protein '1ABC' has no value for mtzfile"):
             generate_jobs(args)
 
+    @pytest.mark.parametrize(
+        ("csv_text", "missing"),
+        [
+            ("name,structure\n1ABC,s.cif\n", "bragg_target, diffuse_target"),
+            ("name,structure,bragg_target\n1ABC,s.cif,x.mtz\n", "diffuse_target"),
+        ],
+    )
+    def test_diffuse_bragg_targets_are_checked_before_any_job_is_queued(
+        self, grid_inputs, csv_text, missing
+    ):
+        args = _grid_args(grid_inputs, csv_text, "--loss-type", "diffuse_bragg")
+
+        with pytest.raises(ValueError, match=f"Protein '1ABC' has no value for {missing} "):
+            generate_jobs(args)
+
+    def test_diffuse_bragg_needs_only_the_target_its_weight_scores(self, grid_inputs):
+        args = _grid_args(
+            grid_inputs,
+            "name,structure,bragg_target\n1ABC,s.cif,x.mtz\n",
+            "--loss-type",
+            "diffuse_bragg",
+            "--bragg-weight",
+            "1.0",
+        )
+
+        (job,) = generate_jobs(args)
+
+        assert job.loss_config["diffuse_bragg"]["loss_options"]["bragg_target"] == str(
+            grid_inputs / "x.mtz"
+        )
+
+    @pytest.mark.parametrize("resolution", ["0", "-1", "nan", "inf"])
+    def test_an_invalid_resolution_fails_before_any_job_is_queued(self, grid_inputs, resolution):
+        args = _grid_args(
+            grid_inputs, f"name,structure,density,resolution\n1ABC,s.cif,d.ccp4,{resolution}\n"
+        )
+
+        with pytest.raises(ValueError, match="Protein '1ABC': resolution must be a positive"):
+            generate_jobs(args)
+
     def test_another_loss_s_flag_is_rejected(self, grid_inputs, capsys):
         with pytest.raises(SystemExit):
             _grid_args(

@@ -9,6 +9,7 @@ from sampleworks.core.losses.options import (
     RealSpaceDensityOptions,
 )
 from sampleworks.core.losses.registry import (
+    bool_from_text,
     build_single_loss,
     coerce_options,
     get_loss_spec,
@@ -147,6 +148,23 @@ class TestOptionsFromText:
     )
     def test_parses_to_the_declared_type(self, name, text, expected):
         assert option_from_text(name, text) == expected
+
+    @pytest.mark.parametrize(
+        "text", ["true", "True", "TRUE", "t", "T", "yes", "Yes", "y", "on", "ON", "1", " true "]
+    )
+    def test_truthy_text_is_true(self, text):
+        assert bool_from_text(text) is True
+
+    @pytest.mark.parametrize(
+        "text", ["false", "False", "FALSE", "f", "F", "no", "No", "n", "off", "OFF", "0", " no "]
+    )
+    def test_falsy_text_is_false(self, text):
+        assert bool_from_text(text) is False
+
+    @pytest.mark.parametrize("text", ["maybe", "", "2", "-1", "truee", "none"])
+    def test_other_text_is_not_a_boolean(self, text):
+        with pytest.raises(ValueError, match="Expected true or false"):
+            bool_from_text(text)
 
     def test_rejects_a_value_that_is_not_a_boolean(self):
         with pytest.raises(ValueError, match="Expected true or false"):

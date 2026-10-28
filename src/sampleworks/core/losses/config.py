@@ -282,7 +282,7 @@ class LossConfig:
         defaults change between versions, and an option that was defaulted is
         otherwise indistinguishable from one that did not exist. Options left at
         ``None`` stay absent, so they remain fillable by
-        :meth:`with_defaults`.
+        :meth:`with_unset_options_from`.
 
         Returns
         -------
@@ -316,8 +316,9 @@ class LossConfig:
         missing = {}
         for entry in self.entries:
             spec = get_loss_spec(entry.loss)
+            options = coerce_options(spec, entry.options)
             absent = tuple(
-                name for name in spec.required_options if entry.options.get(name) is None
+                name for name in spec.required_for(options) if getattr(options, name) is None
             )
             if absent:
                 missing[entry.loss.value] = absent
@@ -357,14 +358,15 @@ class LossConfig:
             )
         return weights
 
-    def with_defaults(self, options: Mapping[str, Any]) -> LossConfig:
+    def with_unset_options_from(self, options: Mapping[str, Any]) -> LossConfig:
         """Fill in options this configuration leaves unset, for whichever losses declare them.
 
-        Grid search reads a row of options per protein (a map, an MTZ, a
-        resolution) long after the loss was chosen. Each value goes to every
-        configured loss that has an option of that name and is ignored by the
-        rest, so one proteins CSV serves any loss. Options already set are left
-        alone -- an explicit value from the user or a config file wins.
+        Grid search reads one protein's options from its proteins-CSV row (see
+        :class:`~sampleworks.utils.protein_input.ProteinInput`) long after the loss
+        was chosen. Each value goes to every configured loss that has an option of
+        that name and is ignored by the rest, so one proteins CSV serves any loss.
+        Where ``options`` and an entry both set an option, the entry wins: a value
+        from the command line or a config file overrides the CSV.
 
         Parameters
         ----------
@@ -379,8 +381,8 @@ class LossConfig:
         entries = []
         for entry in self.entries:
             declared = {f.name for f in dataclasses.fields(get_loss_spec(entry.loss).options_cls)}
-            defaults = {name: value for name, value in options.items() if name in declared}
-            entries.append(replace(entry, options={**defaults, **entry.options}))
+            fill = {name: value for name, value in options.items() if name in declared}
+            entries.append(replace(entry, options={**fill, **entry.options}))
 
         return LossConfig(tuple(entries))
 

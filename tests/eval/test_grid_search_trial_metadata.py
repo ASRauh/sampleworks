@@ -3,7 +3,12 @@
 import json
 from pathlib import Path
 
-from sampleworks.eval.grid_search_eval_utils import load_job_metadata, scan_grid_search_results
+import pytest
+from sampleworks.eval.grid_search_eval_utils import (
+    load_job_metadata,
+    parse_trial_dir,
+    scan_grid_search_results,
+)
 
 
 def test_scan_grid_search_results_prefers_job_metadata(tmp_path) -> None:
@@ -55,6 +60,17 @@ def test_scan_records_the_loss_a_trial_was_guided_with(tmp_path) -> None:
 
     assert trial.loss_type == "structure_factor"
     assert trial.density_path is None
+
+
+@pytest.mark.parametrize(
+    "suffix", ["", "_structure_factor", "_real_space_density+structure_factor", "_diffuse_bragg"]
+)
+def test_trial_dir_loss_suffix_does_not_change_parsed_parameters(suffix) -> None:
+    assert parse_trial_dir(Path(f"ens8_gw0.1_gd2{suffix}")) == {
+        "ensemble_size": 8,
+        "guidance_weight": 0.1,
+        "gd_steps": 2,
+    }
 
 
 def test_load_job_metadata_rejects_non_object_json(tmp_path) -> None:

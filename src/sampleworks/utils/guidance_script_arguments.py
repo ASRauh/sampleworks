@@ -624,7 +624,7 @@ def loss_config_from_args(
     LossConfig
         The selected losses and the options given for them.
     """
-    # The file names its own losses; taking a --loss-type alongside it would
+    # The --loss-config file names its own losses; taking a --loss-type alongside it would
     # mean silently ignoring one of the two. --loss-type always has a default,
     # so "was it passed" has to be answered from the command line itself.
     given = argv if argv is not None else sys.argv[1:]
@@ -637,7 +637,10 @@ def loss_config_from_args(
         )
 
     if args.loss_config is None:
-        return LossConfig.single(args.loss_type, **loss_options_from_args(args))
+        try:
+            return LossConfig.single(args.loss_type, **loss_options_from_args(args))
+        except ValueError as error:
+            parser.error(str(error))
     try:
         return LossConfig.from_file(args.loss_config)
     except (OSError, ValueError) as error:
