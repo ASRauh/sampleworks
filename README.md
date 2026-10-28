@@ -244,7 +244,7 @@ Start an 8-GPU ACTL machine named `sampleworks` with the private Astera
 `sampleworks` image alias and the shared data volume mounted:
 
 ```bash
-actl pod up sampleworks --profile 8x --image sampleworks --storage shared --pvc-size 200Gi --mount diffuse-shared --yes
+actl pod up sampleworks --profile 8x --image sampleworks --storage shared --pvc-size 200Gi
 ```
 
 Keep that terminal open; it maintains sync and SSH. From another terminal:
